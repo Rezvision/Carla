@@ -1,23 +1,26 @@
 # carla_direct_ECU.py  (edited)
 import carla
 import struct
+import json
 from datetime import datetime
 import time
 import random
 import socket  # For UDP communication
 import sys
 
-# --- UDP ports: one per ECU ---
-ECU_PORT_MAP = {
-    0x123: 5100,  # speed
-    0x124: 5101,  # battery
-    0x125: 5102,  # throttle
-    0x126: 5103,  # brake
-    0x127: 5104,  # steering
-    0x128: 5105,  # gear (int)
+# --- UDP ports: one per signal name. We send messages that contain only the
+# signal name and its value (no CAN ID in the UDP payload). Example signal
+# names: 'CAN_speed', 'CAN_battery', etc.
+SIGNAL_PORT_MAP = {
+    "CAN_speed": 5100,
+    "CAN_battery": 5101,
+    "CAN_throttle": 5102,
+    "CAN_brake": 5103,
+    "CAN_steering": 5104,
+    "CAN_gear": 5105,
 }
 
-UDP_TARGET = ("127.0.0.1",)  # each send will use the port from ECU_PORT_MAP
+UDP_TARGET = "192.168.0.125"  # each send will use the port from ECU_PORT_MAP
 
 def connect_to_carla():
     client = carla.Client('localhost', 2000)
@@ -64,10 +67,10 @@ def get_vehicle_data(vehicle, battery_level):
 def setup_udp_sockets():
     """Create a UDP socket per ECU port (for faster sends)."""
     sockets = {}
-    for can_id, port in ECU_PORT_MAP.items():
+    for signal_name, port in SIGNAL_PORT_MAP.items():
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sockets[can_id] = (s, ('127.0.0.1', port))
+        sockets[signal_name] = (s, (UDP_TARGET, port))
     return sockets
 
 def send_to_ecus_via_udp(sockets, vehicle, battery_level):
@@ -77,30 +80,26 @@ def send_to_ecus_via_udp(sockets, vehicle, battery_level):
     """
     data = get_vehicle_data(vehicle, battery_level)
 
-    # Build frames same as original
+    # Build list of (signal_name, value). We will send a small JSON object
+    # containing the signal name and the value. No CAN ID is included.
     frames_data = [
-        (0x123, struct.pack('>f', data["speed_kmh"])),
-        (0x124, struct.pack('>f', data["battery_level"])),
-        (0x125, struct.pack('>f', data["control"]["throttle"])),
-        (0x126, struct.pack('>f', data["control"]["brake"])),
-        (0x127, struct.pack('>f', data["control"]["steering"])),
-        (0x128, struct.pack('>i', data["control"]["gear"])),
+        ("CAN_speed", data["speed_kmh"]),
+        ("CAN_battery", data["battery_level"]),
+        ("CAN_throttle", data["control"]["throttle"]),
+        ("CAN_brake", data["control"]["brake"]),
+        ("CAN_steering", data["control"]["steering"]),
+        ("CAN_gear", data["control"]["gear"]),
     ]
 
-    # Send each to its ECU socket
-    for can_id, packed_data in frames_data:
+    # Send each signal as a JSON payload: {"signal":"CAN_speed","value":123.45}
+    for signal_name, value in frames_data:
         try:
-            s, addr = sockets[can_id]
-            # Optionally reserve MSB of last byte = 0 as before
-            modified_packed = bytearray(packed_data)
-            modified_packed[-1] = modified_packed[-1] & 0x7F
-            s.sendto(bytes(modified_packed), addr)
-            # For diagnostics print what we sent
-            val = (struct.unpack('>f', packed_data)[0]
-                   if can_id != 0x128 else struct.unpack('>i', packed_data)[0])
-            print(f"[UDP->ECU] ID={hex(can_id)} port={addr[1]} value={val}")
+            s, addr = sockets[signal_name]
+            payload = json.dumps({"signal": signal_name, "value": value}).encode()
+            s.sendto(payload, addr)
+            print(f"[UDP->ECU] signal={signal_name} port={addr[1]} value={value}")
         except Exception as e:
-            print(f"Failed UDP send to ECU for ID {hex(can_id)}: {e}", file=sys.stderr)
+            print(f"Failed UDP send for signal {signal_name}: {e}", file=sys.stderr)
 
     return data["updated_battery_level"]
 
