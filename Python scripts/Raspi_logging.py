@@ -54,6 +54,12 @@ def load_average():
 # Throttling status (Pi)
 # ----------------------------
 def throttling_status():
+    """0x0 → No issues
+
+0x2 → CPU frequency capped now
+
+0x20000 → Throttling occurred in the past"""
+
     try:
         output = subprocess.check_output(["vcgencmd", "get_throttled"])
         return output.decode().strip()
