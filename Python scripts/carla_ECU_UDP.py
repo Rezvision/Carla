@@ -16,7 +16,7 @@ SIGNAL_PORT_MAP = {
     "CAN_gear": 5105,
 }
 
-UDP_TARGET = "127.0.0.1"
+UDP_TARGET = "192.168.0.125"
 
 def connect_to_carla():
     client = carla.Client('localhost', 2000)
