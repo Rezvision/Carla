@@ -70,6 +70,7 @@ class DataLogger:
             table = pa.Table.from_pylist(self.buffer)
             if os.path.exists(self.filename):
                 existing = pq.read_table(self.filename)
+                table = table.cast(existing.schema)
                 table = pa.concat_tables([existing, table])
             pq.write_table(table, self.filename, compression='snappy')
         else:
@@ -135,7 +136,7 @@ def get_data(vehicle, battery):
     
     return {
         'speed_kmh': round(speed, 2),
-        'battery_level': round(battery, 2),
+        'battery_level': float(round(battery, 2)),
         'throttle': round(ctrl.throttle, 2),
         'brake': round(ctrl.brake, 2),
         'steering': round(ctrl.steer, 2),
@@ -192,6 +193,8 @@ if __name__ == "__main__":
     try:
         while True:
             for i, vehicle in enumerate(vehicles):
+                if not vehicle.is_alive:
+                    continue
                 data, batteries[i] = get_data(vehicle, batteries[i])
                 data['timestamp'] = datetime.now().isoformat()
                 
