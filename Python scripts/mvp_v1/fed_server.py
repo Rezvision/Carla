@@ -29,7 +29,7 @@ from collections import defaultdict
 import paho.mqtt.client as mqtt
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
-MQTT_BROKER        = "127.0.0.1"
+MQTT_BROKER        = "localhost"
 MQTT_PORT          = 1883
 MIN_CLIENTS        = 2           # Wait for at least this many updates per round
 MAX_WAIT_SEC       = 21600       # 6 hours max wait before round with whatever arrived

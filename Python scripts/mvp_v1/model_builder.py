@@ -38,8 +38,7 @@ def build_trainable_tflite():
     Build a CAN-bus autoencoder with four exported TFLite signatures:
       - 'train'   : one gradient step, returns loss
       - 'infer'   : reconstruction + per-sample MSE
-      - 'save'    : save weights to checkpoint path
-      - 'restore' : restore weights from checkpoint path
+    Checkpointing is handled in Python via numpy (no Flex delegate needed).
     No raw data ever leaves the Pi — only weight arrays are shared.
     """
     import tensorflow as tf
@@ -55,12 +54,12 @@ def build_trainable_tflite():
                 tf.keras.layers.Dense(32,  activation='relu',
                                       kernel_initializer='he_normal'),
                 tf.keras.layers.Dense(16,  activation='relu',
-                                      kernel_initializer='he_normal'),  # bottleneck
+                                      kernel_initializer='he_normal'),
                 tf.keras.layers.Dense(32,  activation='relu',
                                       kernel_initializer='he_normal'),
                 tf.keras.layers.Dense(64,  activation='relu',
                                       kernel_initializer='he_normal'),
-                tf.keras.layers.Dense(INPUT_DIM),  # linear output
+                tf.keras.layers.Dense(INPUT_DIM),
             ])
             self._loss_fn = tf.keras.losses.MeanSquaredError()
             self._optim   = tf.keras.optimizers.Adam(learning_rate=LEARNING_RATE)
@@ -92,36 +91,6 @@ def build_trainable_tflite():
                 "reconstruction_error": mse,
             }
 
-        # ── SAVE signature ───────────────────────────────────────────────────
-        @tf.function(input_signature=[
-            tf.TensorSpec(shape=[], dtype=tf.string, name='checkpoint_path'),
-        ])
-        def save(self, checkpoint_path):
-            """Save model weights to a TF checkpoint on-device."""
-            tensor_names    = [w.name for w in self.model.weights]
-            tensors_to_save = [w.read_value() for w in self.model.weights]
-            tf.raw_ops.Save(
-                filename=checkpoint_path,
-                tensor_names=tensor_names,
-                data=tensors_to_save,
-                name='save')
-            return {"checkpoint_path": checkpoint_path}
-
-        # ── RESTORE signature ────────────────────────────────────────────────
-        @tf.function(input_signature=[
-            tf.TensorSpec(shape=[], dtype=tf.string, name='checkpoint_path'),
-        ])
-        def restore(self, checkpoint_path):
-            """Restore model weights from a TF checkpoint."""
-            for w in self.model.weights:
-                restored = tf.raw_ops.Restore(
-                    file_pattern=checkpoint_path,
-                    tensor_name=w.name,
-                    dt=w.dtype,
-                    name='restore')
-                w.assign(restored)
-            return {"checkpoint_path": checkpoint_path}
-
     # ── Convert to TFLite ────────────────────────────────────────────────────
     module = CANAutoencoder()
 
@@ -134,14 +103,12 @@ def build_trainable_tflite():
         [
             module.train.get_concrete_function(),
             module.infer.get_concrete_function(),
-            module.save.get_concrete_function(),
-            module.restore.get_concrete_function(),
         ],
         module,
     )
+    # Only TFLITE_BUILTINS needed — no Flex delegate required
     converter.target_spec.supported_ops = [
         tf.lite.OpsSet.TFLITE_BUILTINS,
-        tf.lite.OpsSet.SELECT_TF_OPS,  # needed for Save/Restore raw ops
     ]
     converter.experimental_enable_resource_variables = True
 

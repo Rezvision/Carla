@@ -65,8 +65,12 @@ ROLLBACK_PATIENCE    = 3          # rounds of worsening before rollback
 FED_BASE_INTERVAL    = 21600      # 6 hours scheduled federation
 FED_MIN_INTERVAL     = 1800       # 30 min minimum between rounds
 DIVERGENCE_THRESHOLD = 0.10       # gradient norm drift trigger
-MODEL_DIR            = "/home/pi/fed_ids/models"
-CHECKPOINT_DIR       = "/home/pi/fed_ids/checkpoints"
+_BASE_DIR      = os.path.dirname(os.path.abspath(__file__))
+MODEL_DIR      = os.path.join(_BASE_DIR, "models")
+# /tmp is always writable — tf.raw_ops.Save writes directly via OS,
+# bypassing Python's makedirs, so it needs a path that already exists
+CHECKPOINT_DIR = "/tmp/fed_ids_checkpoints"
+os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -77,18 +81,19 @@ CHECKPOINT_DIR       = "/home/pi/fed_ids/checkpoints"
 class OnDeviceModel:
     """
     Wraps the trainable .tflite received from the server.
-    Exposes train / infer / save / restore via TFLite signature runners.
-    Also extracts weight arrays for FedAvg.
+    Only two TFLite signatures used: 'train' and 'infer'.
+    Checkpointing done in Python via numpy — no Flex delegate needed.
+    Weight extraction for FedAvg reads tensor details directly.
     """
 
     def __init__(self):
-        self.interpreter    = None
-        self.train_runner   = None
-        self.infer_runner   = None
-        self.save_runner    = None
-        self.restore_runner = None
-        self.threshold      = 0.05
-        self.is_loaded      = False
+        self.interpreter  = None
+        self.train_runner = None
+        self.infer_runner = None
+        self.threshold    = 0.05
+        self.is_loaded    = False
+        # numpy-based checkpoint: {name: ndarray}
+        self._best_weights = None
 
     def load_from_bytes(self, tflite_bytes: bytes) -> bool:
         """Load model from bytes received via MQTT."""
@@ -102,19 +107,11 @@ class OnDeviceModel:
         if not TFLITE_OK or not os.path.exists(path):
             return False
         try:
-            self.interpreter = tflite.Interpreter(
-                model_path=path,
-                experimental_delegates=[],
-            )
+            self.interpreter  = tflite.Interpreter(model_path=path)
             self.interpreter.allocate_tensors()
-
-            # Bind all four signature runners
-            self.train_runner   = self.interpreter.get_signature_runner('train')
-            self.infer_runner   = self.interpreter.get_signature_runner('infer')
-            self.save_runner    = self.interpreter.get_signature_runner('save')
-            self.restore_runner = self.interpreter.get_signature_runner('restore')
-
-            self.is_loaded = True
+            self.train_runner = self.interpreter.get_signature_runner('train')
+            self.infer_runner = self.interpreter.get_signature_runner('infer')
+            self.is_loaded    = True
             print(f"[Model] Loaded: {path}")
             return True
         except Exception as e:
@@ -124,10 +121,7 @@ class OnDeviceModel:
     # ── Training ─────────────────────────────────────────────────────────────
 
     def train_step(self, x_batch: np.ndarray) -> float:
-        """
-        One gradient step using TFLite 'train' signature.
-        x_batch: (batch, 160) float32
-        """
+        """One gradient step. x_batch: (batch, INPUT_DIM) float32"""
         if not self.is_loaded:
             return float('inf')
         result = self.train_runner(x=x_batch.astype(np.float32))
@@ -136,56 +130,70 @@ class OnDeviceModel:
     # ── Inference ─────────────────────────────────────────────────────────────
 
     def infer(self, x: np.ndarray):
-        """
-        Run anomaly detection on one window.
-        x: (160,) or (1, 160) float32
-        Returns: (is_anomaly: bool, reconstruction_error: float)
-        """
+        """x: (INPUT_DIM,) or (1, INPUT_DIM). Returns (is_anomaly, error)."""
         if not self.is_loaded:
             return False, 0.0
-        x = x.reshape(1, INPUT_DIM).astype(np.float32)
+        x      = x.reshape(1, INPUT_DIM).astype(np.float32)
         result = self.infer_runner(x=x)
         error  = float(result['reconstruction_error'][0])
         return error > self.threshold, error
 
-    # ── Checkpointing ─────────────────────────────────────────────────────────
+    # ── Numpy checkpointing (replaces TFLite save/restore) ───────────────────
 
     def save_checkpoint(self, name: str = "best") -> str:
+        """Save current weights to a .npz file via numpy."""
+        weights = self.get_weights()
+        if not weights:
+            return ""
         os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-        path = os.path.join(CHECKPOINT_DIR, name)
-        self.save_runner(checkpoint_path=np.array(path.encode()))
+        path = os.path.join(CHECKPOINT_DIR, f"{name}.npz")
+        np.savez(path, *weights)
+        print(f"[Model] Checkpoint saved: {path}")
         return path
 
     def restore_checkpoint(self, name: str = "best"):
-        path = os.path.join(CHECKPOINT_DIR, name)
-        self.restore_runner(checkpoint_path=np.array(path.encode()))
-        print(f"[Model] Restored checkpoint: {path}")
+        """Restore weights from .npz file back into the TFLite interpreter."""
+        path = os.path.join(CHECKPOINT_DIR, f"{name}.npz")
+        if not os.path.exists(path):
+            print(f"[Model] No checkpoint at {path}")
+            return
+        data    = np.load(path)
+        arrays  = [data[k] for k in sorted(data.files)]
+        self._set_weights(arrays)
+        print(f"[Model] Restored: {path}")
 
-    # ── Weight extraction for FedAvg ──────────────────────────────────────────
+    # ── Weight extraction / injection for FedAvg ─────────────────────────────
 
     def get_weights(self) -> list:
         """
-        Extract all trainable weight tensors as numpy arrays.
-        Used to send to the server for FedAvg aggregation.
+        Extract trainable weight tensors as numpy arrays.
+        Runs a dummy infer first to ensure tensors are populated.
         """
         if not self.is_loaded:
             return []
-        # Run dummy inference to populate tensors
         dummy = np.zeros((1, INPUT_DIM), dtype=np.float32)
         self.infer_runner(x=dummy)
-
         weights = []
         for td in self.interpreter.get_tensor_details():
             name = td['name']
-            # Collect kernel and bias tensors (skip internal TF ops)
             if ('dense' in name.lower() and
                     ('kernel' in name.lower() or 'bias' in name.lower()) and
-                    'adam' not in name.lower() and
-                    'gradient' not in name.lower()):
-                weights.append(
-                    self.interpreter.get_tensor(td['index']).copy()
-                )
+                    'adam' not in name.lower()):
+                weights.append(self.interpreter.get_tensor(td['index']).copy())
         return weights
+
+    def _set_weights(self, arrays: list):
+        """Inject weight arrays back into interpreter tensors."""
+        idx = 0
+        for td in self.interpreter.get_tensor_details():
+            name = td['name']
+            if ('dense' in name.lower() and
+                    ('kernel' in name.lower() or 'bias' in name.lower()) and
+                    'adam' not in name.lower()):
+                if idx < len(arrays):
+                    self.interpreter.set_tensor(td['index'],
+                                                arrays[idx].astype(np.float32))
+                    idx += 1
 
     # ── Threshold calibration ─────────────────────────────────────────────────
 
@@ -193,7 +201,7 @@ class OnDeviceModel:
         if len(normal_errors) > 20:
             self.threshold = float(
                 np.percentile(normal_errors, ANOMALY_PERCENTILE))
-            print(f"[Model] Anomaly threshold updated: {self.threshold:.6f}")
+            print(f"[Model] Threshold: {self.threshold:.6f}")
 
 
 # ─────────────────────────────────────────────
