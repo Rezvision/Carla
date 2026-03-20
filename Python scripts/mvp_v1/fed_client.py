@@ -80,11 +80,12 @@ os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
 class OnDeviceModel:
     """
-    Wraps the trainable .tflite received from the server.
-    Only two TFLite signatures used: 'train' and 'infer'.
-    Checkpointing done in Python via numpy — no Flex delegate needed.
-    Weight extraction for FedAvg reads tensor details directly.
+    Stateless TFLite autoencoder.
+    Weights are numpy arrays in Python, passed into every train/infer call.
+    No resource variables → no segfaults on Pi tflite-runtime.
     """
+
+    DIMS = [160, 64, 32, 16, 32, 64, 160]
 
     def __init__(self):
         self.interpreter  = None
@@ -92,15 +93,27 @@ class OnDeviceModel:
         self.infer_runner = None
         self.threshold    = 0.05
         self.is_loaded    = False
-        # numpy-based checkpoint: {name: ndarray}
-        self._best_weights = None
+        self.weights      = []   # [w0..w5]
+        self.biases       = []   # [b0..b5]
+        self._init_weights()
 
-    def load_from_bytes(self, tflite_bytes: bytes) -> bool:
-        """Load model from bytes received via MQTT."""
+    def _init_weights(self):
+        dims = self.DIMS
+        self.weights, self.biases = [], []
+        for i in range(len(dims) - 1):
+            scale = np.sqrt(2.0 / dims[i])
+            self.weights.append(
+                (np.random.randn(dims[i], dims[i+1]) * scale).astype(np.float32))
+            self.biases.append(np.zeros(dims[i+1], dtype=np.float32))
+
+    def load_from_bytes(self, tflite_bytes: bytes, dims: list = None) -> bool:
         os.makedirs(MODEL_DIR, exist_ok=True)
         path = os.path.join(MODEL_DIR, "current_model.tflite")
         with open(path, "wb") as f:
             f.write(tflite_bytes)
+        if dims:
+            self.DIMS = dims
+            self._init_weights()
         return self.load_from_file(path)
 
     def load_from_file(self, path: str) -> bool:
@@ -118,91 +131,71 @@ class OnDeviceModel:
             print(f"[Model] Load error: {e}")
             return False
 
+    def _weight_kwargs(self):
+        kw = {}
+        for i, (w, b) in enumerate(zip(self.weights, self.biases)):
+            kw[f'w{i}'] = w
+            kw[f'b{i}'] = b
+        return kw
+
     # ── Training ─────────────────────────────────────────────────────────────
 
     def train_step(self, x_batch: np.ndarray) -> float:
-        """One gradient step. x_batch: (batch, INPUT_DIM) float32"""
         if not self.is_loaded:
             return float('inf')
-        result = self.train_runner(x=x_batch.astype(np.float32))
+        kw     = self._weight_kwargs()
+        result = self.train_runner(x=x_batch.astype(np.float32), **kw)
+        for i in range(len(self.weights)):
+            self.weights[i] = result[f'w{i}'].copy()
+            self.biases[i]  = result[f'b{i}'].copy()
         return float(result['loss'])
 
     # ── Inference ─────────────────────────────────────────────────────────────
 
     def infer(self, x: np.ndarray):
-        """x: (INPUT_DIM,) or (1, INPUT_DIM). Returns (is_anomaly, error)."""
         if not self.is_loaded:
             return False, 0.0
-        x      = x.reshape(1, INPUT_DIM).astype(np.float32)
-        result = self.infer_runner(x=x)
+        kw     = self._weight_kwargs()
+        result = self.infer_runner(
+            x=x.reshape(1, INPUT_DIM).astype(np.float32), **kw)
         error  = float(result['reconstruction_error'][0])
         return error > self.threshold, error
 
-    # ── Numpy checkpointing (replaces TFLite save/restore) ───────────────────
+    # ── Numpy checkpointing ───────────────────────────────────────────────────
 
     def save_checkpoint(self, name: str = "best") -> str:
-        """Save current weights to a .npz file via numpy."""
-        weights = self.get_weights()
-        if not weights:
-            return ""
         os.makedirs(CHECKPOINT_DIR, exist_ok=True)
         path = os.path.join(CHECKPOINT_DIR, f"{name}.npz")
-        np.savez(path, *weights)
+        np.savez(path, *self.weights, *self.biases)
         print(f"[Model] Checkpoint saved: {path}")
         return path
 
     def restore_checkpoint(self, name: str = "best"):
-        """Restore weights from .npz file back into the TFLite interpreter."""
         path = os.path.join(CHECKPOINT_DIR, f"{name}.npz")
         if not os.path.exists(path):
             print(f"[Model] No checkpoint at {path}")
             return
-        data    = np.load(path)
-        arrays  = [data[k] for k in sorted(data.files)]
-        self._set_weights(arrays)
+        data   = np.load(path)
+        arrays = [data[k] for k in sorted(data.files)]
+        n = len(self.weights)
+        self.weights = [arrays[i].astype(np.float32) for i in range(n)]
+        self.biases  = [arrays[i+n].astype(np.float32) for i in range(n)]
         print(f"[Model] Restored: {path}")
 
-    # ── Weight extraction / injection for FedAvg ─────────────────────────────
+    # ── FedAvg weight interface ───────────────────────────────────────────────
 
     def get_weights(self) -> list:
-        """
-        Extract trainable weight tensors as numpy arrays for FedAvg.
-        Manual model uses variable names W0,b0,W1,b1,...
-        """
-        if not self.is_loaded:
-            return []
-        dummy = np.zeros((1, INPUT_DIM), dtype=np.float32)
-        self.infer_runner(x=dummy)
-        weights = []
-        for td in self.interpreter.get_tensor_details():
-            name = td['name']
-            # Match W0..W5 and b0..b5, skip Adam moment variables (mW, vW, mb, vb)
-            if (name.startswith('W') or name.startswith('b')) and \
-               len(name) <= 3 and name[1:].isdigit() and \
-               'adam' not in name.lower():
-                weights.append(self.interpreter.get_tensor(td['index']).copy())
-        # Sort by name so order is consistent: W0,b0,W1,b1,...
-        tensors = {}
-        for td in self.interpreter.get_tensor_details():
-            name = td['name']
-            if (name.startswith('W') or name.startswith('b')) and \
-               len(name) <= 3 and name[1:].isdigit():
-                tensors[name] = self.interpreter.get_tensor(td['index']).copy()
-        return [tensors[k] for k in sorted(tensors.keys())]
+        """Return [w0,b0,w1,b1,...] for FedAvg. No TFLite call needed."""
+        result = []
+        for w, b in zip(self.weights, self.biases):
+            result.extend([w.copy(), b.copy()])
+        return result
 
-    def _set_weights(self, arrays: list):
-        """Inject weight arrays back into interpreter tensors."""
-        tensors = {}
-        for td in self.interpreter.get_tensor_details():
-            name = td['name']
-            if (name.startswith('W') or name.startswith('b')) and \
-               len(name) <= 3 and name[1:].isdigit():
-                tensors[name] = td['index']
-        sorted_keys = sorted(tensors.keys())
-        for i, key in enumerate(sorted_keys):
-            if i < len(arrays):
-                self.interpreter.set_tensor(
-                    tensors[key], arrays[i].astype(np.float32))
+    def set_weights_from_fedavg(self, flat_list: list):
+        n = len(self.weights)
+        for i in range(n):
+            self.weights[i] = flat_list[i * 2].astype(np.float32)
+            self.biases[i]  = flat_list[i * 2 + 1].astype(np.float32)
 
     # ── Threshold calibration ─────────────────────────────────────────────────
 
@@ -564,19 +557,25 @@ class FederatedClient:
     # ── Apply global model ────────────────────────────────────────────────────
 
     def _apply_global_model(self, data: dict):
-        """Load new .tflite from server and update our model."""
+        """Load new .tflite from server and update weights."""
         round_num    = data.get("round", self.current_round + 1)
         tflite_bytes = data.get("tflite_bytes")
+        dims         = data.get("dims", None)
 
         if tflite_bytes is None:
             print("[Client] Global model payload missing tflite_bytes")
             return
 
         print(f"[Client] Applying global model from round {round_num}...")
-        if self.model.load_from_bytes(tflite_bytes):
+
+        # If server sent averaged weights (FedAvg round), apply them first
+        fedavg_weights = data.get("fedavg_weights")
+        if fedavg_weights is not None:
+            self.model.set_weights_from_fedavg(fedavg_weights)
+
+        if self.model.load_from_bytes(tflite_bytes, dims):
             self.current_round = round_num
-            self.phase         = "federated_training"
-            # Store reference point for divergence tracking
+            self.phase         = "local_pretraining"
             weights = self.model.get_weights()
             if weights:
                 self.trigger.store_reference(weights, self.current_loss)
