@@ -166,8 +166,8 @@ class OnDeviceModel:
 
     def get_weights(self) -> list:
         """
-        Extract trainable weight tensors as numpy arrays.
-        Runs a dummy infer first to ensure tensors are populated.
+        Extract trainable weight tensors as numpy arrays for FedAvg.
+        Manual model uses variable names W0,b0,W1,b1,...
         """
         if not self.is_loaded:
             return []
@@ -176,24 +176,33 @@ class OnDeviceModel:
         weights = []
         for td in self.interpreter.get_tensor_details():
             name = td['name']
-            if ('dense' in name.lower() and
-                    ('kernel' in name.lower() or 'bias' in name.lower()) and
-                    'adam' not in name.lower()):
+            # Match W0..W5 and b0..b5, skip Adam moment variables (mW, vW, mb, vb)
+            if (name.startswith('W') or name.startswith('b')) and \
+               len(name) <= 3 and name[1:].isdigit() and \
+               'adam' not in name.lower():
                 weights.append(self.interpreter.get_tensor(td['index']).copy())
-        return weights
+        # Sort by name so order is consistent: W0,b0,W1,b1,...
+        tensors = {}
+        for td in self.interpreter.get_tensor_details():
+            name = td['name']
+            if (name.startswith('W') or name.startswith('b')) and \
+               len(name) <= 3 and name[1:].isdigit():
+                tensors[name] = self.interpreter.get_tensor(td['index']).copy()
+        return [tensors[k] for k in sorted(tensors.keys())]
 
     def _set_weights(self, arrays: list):
         """Inject weight arrays back into interpreter tensors."""
-        idx = 0
+        tensors = {}
         for td in self.interpreter.get_tensor_details():
             name = td['name']
-            if ('dense' in name.lower() and
-                    ('kernel' in name.lower() or 'bias' in name.lower()) and
-                    'adam' not in name.lower()):
-                if idx < len(arrays):
-                    self.interpreter.set_tensor(td['index'],
-                                                arrays[idx].astype(np.float32))
-                    idx += 1
+            if (name.startswith('W') or name.startswith('b')) and \
+               len(name) <= 3 and name[1:].isdigit():
+                tensors[name] = td['index']
+        sorted_keys = sorted(tensors.keys())
+        for i, key in enumerate(sorted_keys):
+            if i < len(arrays):
+                self.interpreter.set_tensor(
+                    tensors[key], arrays[i].astype(np.float32))
 
     # ── Threshold calibration ─────────────────────────────────────────────────
 
