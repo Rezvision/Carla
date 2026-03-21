@@ -141,6 +141,7 @@ class OnDeviceModel:
     # ── Training ─────────────────────────────────────────────────────────────
 
     def train_step(self, x_batch: np.ndarray) -> float:
+        """One SGD step via TFLite train signature."""
         if not self.is_loaded:
             return float('inf')
         kw     = self._weight_kwargs()
@@ -150,15 +151,36 @@ class OnDeviceModel:
             self.biases[i]  = result[f'b{i}'].copy()
         return float(result['loss'])
 
-    # ── Inference ─────────────────────────────────────────────────────────────
+    def reload_interpreter(self):
+        """
+        Reload the TFLite interpreter from disk to clear accumulated
+        memory state. Call between training epochs on tflite-runtime 2.14
+        to prevent double-free corruption from repeated kwargs calls.
+        """
+        path = os.path.join(MODEL_DIR, "current_model.tflite")
+        if os.path.exists(path):
+            self.interpreter  = tflite.Interpreter(model_path=path)
+            self.interpreter.allocate_tensors()
+            self.train_runner = self.interpreter.get_signature_runner('train')
+            self.infer_runner = self.interpreter.get_signature_runner('infer')
+
+    # ── Inference (pure numpy — avoids repeated TFLite kwargs memory bug) ────
+
+    def _numpy_forward(self, x: np.ndarray) -> np.ndarray:
+        """Pure numpy forward pass using self.weights/biases."""
+        h = x.reshape(1, INPUT_DIM).astype(np.float32)
+        for i, (w, b) in enumerate(zip(self.weights, self.biases)):
+            z = h @ w + b
+            h = 1.0 / (1.0 + np.exp(-z)) if i < len(self.weights) - 1 else z
+        return h
 
     def infer(self, x: np.ndarray):
-        if not self.is_loaded:
+        """Anomaly detection using pure numpy — no TFLite call."""
+        if not self.weights:
             return False, 0.0
-        kw     = self._weight_kwargs()
-        result = self.infer_runner(
-            x=x.reshape(1, INPUT_DIM).astype(np.float32), **kw)
-        error  = float(result['reconstruction_error'][0])
+        output = self._numpy_forward(x)
+        x_flat = x.reshape(1, INPUT_DIM).astype(np.float32)
+        error  = float(np.mean((x_flat - output) ** 2))
         return error > self.threshold, error
 
     # ── Numpy checkpointing ───────────────────────────────────────────────────
@@ -612,6 +634,10 @@ class FederatedClient:
         # ── Local training ────────────────────────────────────────────────
         losses = []
         for epoch in range(LOCAL_EPOCHS):
+            # Reload interpreter between epochs to clear tflite-runtime
+            # 2.14 memory state — prevents double-free corruption
+            if epoch > 0:
+                self.model.reload_interpreter()
             idx  = np.random.permutation(len(windows))
             for i in range(0, len(windows), BATCH_SIZE):
                 batch = windows[idx[i:i + BATCH_SIZE]]
@@ -619,6 +645,8 @@ class FederatedClient:
                     continue
                 loss = self.model.train_step(batch)
                 losses.append(loss)
+        # Reload once more after training to reset interpreter state
+        self.model.reload_interpreter()
 
         avg_loss = float(np.mean(losses)) if losses else float('inf')
         self.current_loss = avg_loss
