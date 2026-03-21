@@ -1,46 +1,59 @@
 # fed_client.py  –  Federated Learning Edge Client (Raspberry Pi)
 """
-Runs on each Raspberry Pi. Zero PyTorch dependency.
+Runs on each Raspberry Pi.
 
-Key design:
+Architecture:
   ┌─────────────────────────────────────────────────────┐
   │  PHASE 1 — Bootstrap                                │
-  │  Receives trainable .tflite from server via MQTT    │
-  │  (untrained model, random weights)                  │
+  │  Loads weights from checkpoint or starts fresh      │
   ├─────────────────────────────────────────────────────┤
   │  PHASE 2 — Local pre-training                       │
-  │  Calls tflite 'train' signature on local CAN data   │
-  │  until loss stabilises (no server contact)          │
+  │  GRU autoencoder trains on local CAN data           │
+  │  Anomaly detection DISABLED until threshold         │
+  │  calibrated on real normal data (no false positives)│
   ├─────────────────────────────────────────────────────┤
   │  PHASE 3 — Federation                               │
   │  Sends weight arrays to server (NOT raw data)       │
-  │  Receives averaged global .tflite from server       │
+  │  Receives FedAvg-averaged weights from server       │
   │  Continues local training on top of global model    │
   ├─────────────────────────────────────────────────────┤
   │  PHASE 4 — Continuous improvement                   │
   │  Rollback to best checkpoint if loss increases      │
-  │  Hybrid trigger: federate on gradient drift OR      │
+  │  Hybrid trigger: federate on weight drift OR        │
   │  every 6 hours                                      │
   └─────────────────────────────────────────────────────┘
+
+Model (seq2seq GRU autoencoder):
+  Encoder : GRU over 20 input timesteps  (batch, 20, 8) → h_enc (batch, 32)
+  Decoder : GRU unrolled for 20 steps, seeded with h_enc, autoregressive
+            each step: GRU([prev_out, h]) → out_t (batch, 8)
+  Loss    : MSE at every timestep — full sequence reconstruction
+  Training: pure numpy BPTT through encoder + decoder (no TFLite C++)
+  Infer   : pure numpy forward pass
+
+TFLite runtime is kept for:
+  - Loading / validating .tflite model files received from server
+  - Future: GRU TFLite model for inference acceleration
 
 Requirements (Raspberry Pi):
   pip install tflite-runtime paho-mqtt numpy python-can
 """
 
 import os
-os.environ["TFLITE_DISABLE_XNNPACK"] = "1"   # must be set before tflite import
+os.environ["TFLITE_DISABLE_XNNPACK"] = "1"   # before tflite import
 import json
 import time
 import struct
 import pickle
 import queue
+import shutil
 import threading
 import numpy as np
 from collections import deque
-from datetime import datetime
+
 import paho.mqtt.client as mqtt
 
-# TFLite runtime — must support SELECT_TF_OPS (tflite-runtime >= 2.9)
+# ── TFLite import (optional, kept for model file validation) ──────────────────
 try:
     import tflite_runtime.interpreter as tflite
     TFLITE_OK = True
@@ -49,157 +62,362 @@ except ImportError:
         import tensorflow.lite as tflite
         TFLITE_OK = True
     except ImportError:
-        print("FATAL: tflite-runtime not found. "
-              "Install: pip install tflite-runtime")
+        print("[Warning] tflite-runtime not found — model file validation disabled")
         TFLITE_OK = False
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
-INPUT_DIM            = 160        # 20 timesteps × 8 CAN features
+INPUT_DIM            = 160        # WINDOW_SIZE × N_FEATURES (flat)
 WINDOW_SIZE          = 20
 N_FEATURES           = 8
-LOCAL_TRAIN_INTERVAL = 300        # seconds between local training cycles
-MIN_BUFFER_FRAMES    = 200        # minimum CAN frames before first training
-LOCAL_EPOCHS         = 3          # epochs per local training cycle
+GRU_HIDDEN           = 32        # GRU hidden units (shared encoder & decoder)
+LOCAL_TRAIN_INTERVAL = 300       # seconds between local training cycles
+MIN_BUFFER_FRAMES    = 200       # min CAN frames before first training
+LOCAL_EPOCHS         = 3         # epochs per local training cycle
 BATCH_SIZE           = 32
-LR                   = 0.001      # SGD learning rate for numpy train step
-ANOMALY_PERCENTILE   = 97         # threshold calibration
-ROLLBACK_PATIENCE    = 3          # rounds of worsening before rollback
-FED_BASE_INTERVAL    = 21600      # 6 hours scheduled federation
-FED_MIN_INTERVAL     = 1800       # 30 min minimum between rounds
-DIVERGENCE_THRESHOLD = 0.10       # gradient norm drift trigger
+LR                   = 0.001     # SGD learning rate
+ANOMALY_PERCENTILE   = 97        # percentile used for threshold calibration
+ROLLBACK_PATIENCE    = 3         # consecutive worsening rounds before rollback
+FED_BASE_INTERVAL    = 21600     # 6 hours base federation interval
+FED_MIN_INTERVAL     = 1800      # 30 min minimum between federation rounds
+DIVERGENCE_THRESHOLD = 0.10      # weight-drift trigger for early federation
 _BASE_DIR      = os.path.dirname(os.path.abspath(__file__))
 MODEL_DIR      = os.path.join(_BASE_DIR, "models")
-# /tmp is always writable — tf.raw_ops.Save writes directly via OS,
-# bypassing Python's makedirs, so it needs a path that already exists
 CHECKPOINT_DIR = "/tmp/fed_ids_checkpoints"
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+os.makedirs(MODEL_DIR, exist_ok=True)
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-# ─────────────────────────────────────────────
-# SECTION 1: On-device TFLite model wrapper
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 1: GRU Autoencoder  (pure numpy, thread-safe)
+# ─────────────────────────────────────────────────────────────────────────────
 
-class OnDeviceModel:
+def _sig(x: np.ndarray) -> np.ndarray:
+    return 1.0 / (1.0 + np.exp(-np.clip(x, -15.0, 15.0)))
+
+
+class GRUAutoencoder:
     """
-    Stateless TFLite autoencoder.
-    Weights are numpy arrays in Python, passed into every train/infer call.
-    No resource variables → no segfaults on Pi tflite-runtime.
+    Sequence-to-sequence GRU autoencoder — symmetric encoder/decoder.
+
+    Encoder: GRU unrolled over 20 input timesteps  → last hidden state h_enc
+    Decoder: GRU unrolled for 20 output timesteps, initialised with h_enc.
+             At each step the previous reconstructed frame is fed as input
+             (free-running), so the decoder generates the full sequence
+             conditioned purely on the compressed hidden state.
+    Output:  linear projection Wo per timestep → N_FEATURES values
+
+    Why GRU decoder is better than MLP decoder for this task:
+      • Reconstruction is timestep-aware — anomaly can be localised
+      • Gradient flows through the full sequence, not a single matrix multiply
+      • Symmetric architecture; encoder and decoder share the same inductive bias
+      • More sensitive to temporal pattern deviations (e.g. sudden CAN floods)
+
+    TFLite runtime is kept for .tflite file validation when the server sends
+    a model update.  All compute (train + infer) is pure numpy.
     """
 
-    DIMS = [160, 64, 32, 16, 32, 64, 160]
+    # Encoder weights (7)  +  decoder weights (9)  =  16 total
+    _WEIGHT_KEYS = (
+        'Wr',     'br',                          # encoder reset gate
+        'Wz',     'bz',                          # encoder update gate
+        'Wn_x',   'Wn_h',  'bn',                # encoder new gate
+        'Dec_Wr', 'Dec_br',                      # decoder reset gate
+        'Dec_Wz', 'Dec_bz',                      # decoder update gate
+        'Dec_Wn_x', 'Dec_Wn_h', 'Dec_bn',       # decoder new gate
+        'Wo',     'bo',                          # output projection
+    )
 
     def __init__(self):
-        self.interpreter  = None
-        self.train_runner = None
-        self.infer_runner = None
-        self.threshold    = 0.05
-        self.is_loaded    = False
-        self.weights      = []   # [w0..w5]
-        self.biases       = []   # [b0..b5]
+        self.threshold  = float('inf')
+        self.calibrated = False
+        self.is_loaded  = True
+        self._lock      = threading.Lock()
+        self._tflite_interp = None
         self._init_weights()
 
-    def _init_weights(self):
-        dims = self.DIMS
-        self.weights, self.biases = [], []
-        for i in range(len(dims) - 1):
-            scale = np.sqrt(2.0 / dims[i])
-            self.weights.append(
-                (np.random.randn(dims[i], dims[i+1]) * scale).astype(np.float32))
-            self.biases.append(np.zeros(dims[i+1], dtype=np.float32))
+    # ── Weight init ──────────────────────────────────────────────────────────
 
-    def load_from_bytes(self, tflite_bytes: bytes, dims: list = None) -> bool:
-        os.makedirs(MODEL_DIR, exist_ok=True)
+    def _init_weights(self):
+        F, H = N_FEATURES, GRU_HIDDEN
+        xh_enc = F + H   # encoder: [x_t, h_enc]  concatenated input
+        xh_dec = F + H   # decoder: [prev_out, h_dec] — same sizes
+
+        def w(r, c):
+            return (np.random.randn(r, c) * np.sqrt(2.0 / (r + c))).astype(np.float32)
+        def b(n):
+            return np.zeros(n, dtype=np.float32)
+
+        # Encoder GRU
+        self.Wr    = w(xh_enc, H); self.br    = b(H)
+        self.Wz    = w(xh_enc, H); self.bz    = b(H)
+        self.Wn_x  = w(F,      H); self.Wn_h  = w(H, H); self.bn  = b(H)
+
+        # Decoder GRU  (same shape as encoder — symmetric)
+        self.Dec_Wr   = w(xh_dec, H); self.Dec_br   = b(H)
+        self.Dec_Wz   = w(xh_dec, H); self.Dec_bz   = b(H)
+        self.Dec_Wn_x = w(F,      H); self.Dec_Wn_h = w(H, H); self.Dec_bn = b(H)
+
+        # Output projection: hidden → one reconstructed frame
+        self.Wo = w(H, F); self.bo = b(F)
+
+    # ── TFLite file validation (weights stay numpy) ───────────────────────────
+
+    def load_from_bytes(self, tflite_bytes: bytes) -> bool:
         path = os.path.join(MODEL_DIR, "current_model.tflite")
         with open(path, "wb") as f:
             f.write(tflite_bytes)
-        if dims:
-            self.DIMS = dims
-            self._init_weights()
-        return self.load_from_file(path)
+        return self._validate_tflite(path)
 
-    def load_from_file(self, path: str) -> bool:
+    def _validate_tflite(self, path: str) -> bool:
         if not TFLITE_OK or not os.path.exists(path):
-            return False
-        try:
-            self.interpreter  = tflite.Interpreter(
-                model_path=path,
-                num_threads=1,
-            )
-            self.interpreter.allocate_tensors()
-            self.train_runner = self.interpreter.get_signature_runner('train')
-            self.infer_runner = self.interpreter.get_signature_runner('infer')
-            self.is_loaded    = True
-            print(f"[Model] Loaded: {path}")
             return True
+        try:
+            interp = tflite.Interpreter(model_path=path, num_threads=1)
+            interp.allocate_tensors()
+            self._tflite_interp = interp
+            print(f"[Model] TFLite file validated: {path}")
         except Exception as e:
-            print(f"[Model] Load error: {e}")
-            return False
+            print(f"[Model] TFLite validation warning: {e} — numpy weights unaffected")
+        return True
 
-    def _weight_kwargs(self):
-        kw = {}
-        for i, (w, b) in enumerate(zip(self.weights, self.biases)):
-            kw[f'w{i}'] = w
-            kw[f'b{i}'] = b
-        return kw
+    # ── Encoder forward (GRU) ────────────────────────────────────────────────
 
-    # ── Training (pure numpy — eliminates TFLite C++ memory corruption) ──────
+    def _enc_forward(self, x_seq: np.ndarray):
+        """x_seq: (batch, WINDOW_SIZE, F) → h_enc: (batch, H), cache list"""
+        batch = x_seq.shape[0]
+        h     = np.zeros((batch, GRU_HIDDEN), dtype=np.float32)
+        cache = []
+        for t in range(WINDOW_SIZE):
+            x  = x_seq[:, t, :]
+            xh = np.concatenate([x, h], axis=1)
+            r  = _sig(xh @ self.Wr + self.br)
+            z  = _sig(xh @ self.Wz + self.bz)
+            n  = np.tanh(x @ self.Wn_x + (r * h) @ self.Wn_h + self.bn)
+            h_new = (1.0 - z) * h + z * n
+            cache.append((x, h, xh, r, z, n))
+            h = h_new
+        return h, cache
+
+    # ── Decoder forward (GRU, free-running) ──────────────────────────────────
+
+    def _dec_forward(self, h_enc: np.ndarray):
+        """
+        h_enc: (batch, H) — initialises decoder hidden state.
+        Generates WINDOW_SIZE frames autoregressively.
+        Returns recon: (batch, WINDOW_SIZE, F) and per-step cache.
+        """
+        batch    = h_enc.shape[0]
+        h        = h_enc.copy()
+        prev_out = np.zeros((batch, N_FEATURES), dtype=np.float32)
+        outputs  = []
+        cache    = []
+        for _ in range(WINDOW_SIZE):
+            xh    = np.concatenate([prev_out, h], axis=1)
+            r     = _sig(xh @ self.Dec_Wr + self.Dec_br)
+            z     = _sig(xh @ self.Dec_Wz + self.Dec_bz)
+            n     = np.tanh(prev_out @ self.Dec_Wn_x
+                            + (r * h) @ self.Dec_Wn_h + self.Dec_bn)
+            h_new = (1.0 - z) * h + z * n
+            out_t = h_new @ self.Wo + self.bo          # (batch, F)
+            cache.append((prev_out, h, xh, r, z, n, h_new))
+            outputs.append(out_t)
+            prev_out = out_t
+            h        = h_new
+        return np.stack(outputs, axis=1), cache        # (batch, T, F)
+
+    # ── Encoder backward (BPTT) ──────────────────────────────────────────────
+
+    def _enc_backward(self, d_h_enc, cache):
+        """Given gradient w.r.t. encoder's last hidden state, return weight grads."""
+        dWr = np.zeros_like(self.Wr);   dbr = np.zeros_like(self.br)
+        dWz = np.zeros_like(self.Wz);   dbz = np.zeros_like(self.bz)
+        dWn_x = np.zeros_like(self.Wn_x)
+        dWn_h = np.zeros_like(self.Wn_h)
+        dbn   = np.zeros_like(self.bn)
+
+        dh = d_h_enc
+        for t in reversed(range(WINDOW_SIZE)):
+            x, h_prev, xh, r, z, n = cache[t]
+            dh_prev  = dh * (1.0 - z)
+            d_z_pre  = dh * (n - h_prev) * z * (1.0 - z)
+            d_n      = dh * z * (1.0 - n ** 2)
+
+            dWn_x   += x.T @ d_n
+            dbn     += d_n.sum(axis=0)
+            d_rh     = d_n @ self.Wn_h.T
+            dWn_h   += (r * h_prev).T @ d_n
+            d_r_post = d_rh * h_prev
+            dh_prev += d_rh * r
+
+            d_r_pre  = d_r_post * r * (1.0 - r)
+            dWr     += xh.T @ d_r_pre
+            dbr     += d_r_pre.sum(axis=0)
+            dh_prev += (d_r_pre @ self.Wr.T)[:, N_FEATURES:]
+
+            dWz     += xh.T @ d_z_pre
+            dbz     += d_z_pre.sum(axis=0)
+            dh_prev += (d_z_pre @ self.Wz.T)[:, N_FEATURES:]
+
+            dh = dh_prev
+        return dWr, dbr, dWz, dbz, dWn_x, dWn_h, dbn
+
+    # ── Decoder backward (BPTT) ──────────────────────────────────────────────
+
+    def _dec_backward(self, d_recon, cache):
+        """
+        d_recon: (batch, WINDOW_SIZE, F) — gradient from MSE loss.
+        Returns d_h_enc (connects back into encoder) + decoder weight grads.
+
+        At each step t the gradient has two sources:
+          1. Direct loss on out_t  (d_recon[:, t, :])
+          2. d_prev_out from step t+1 — because out_t is fed as input to t+1
+        """
+        batch = d_recon.shape[0]
+        dDec_Wr  = np.zeros_like(self.Dec_Wr)
+        dDec_Wz  = np.zeros_like(self.Dec_Wz)
+        dDec_Wn_x = np.zeros_like(self.Dec_Wn_x)
+        dDec_Wn_h = np.zeros_like(self.Dec_Wn_h)
+        dDec_br  = np.zeros_like(self.Dec_br)
+        dDec_bz  = np.zeros_like(self.Dec_bz)
+        dDec_bn  = np.zeros_like(self.Dec_bn)
+        dWo      = np.zeros_like(self.Wo)
+        dbo      = np.zeros_like(self.bo)
+
+        d_h_next   = np.zeros((batch, GRU_HIDDEN), dtype=np.float32)
+        d_prev_out = np.zeros((batch, N_FEATURES),  dtype=np.float32)
+
+        for t in reversed(range(WINDOW_SIZE)):
+            prev_out, h_prev, xh, r, z, n, h_new = cache[t]
+
+            # Total gradient on out_t: from loss + from being used as next input
+            d_out_t = d_recon[:, t, :] + d_prev_out
+
+            # out_t = h_new @ Wo + bo
+            dWo    += h_new.T @ d_out_t
+            dbo    += d_out_t.sum(axis=0)
+            d_h_new = d_out_t @ self.Wo.T + d_h_next
+
+            # h_new = (1-z)*h_prev + z*n
+            dh_prev  = d_h_new * (1.0 - z)
+            d_z_pre  = d_h_new * (n - h_prev) * z * (1.0 - z)
+            d_n      = d_h_new * z * (1.0 - n ** 2)
+
+            # n = tanh(prev_out @ Dec_Wn_x + (r*h_prev) @ Dec_Wn_h + Dec_bn)
+            dDec_Wn_x += prev_out.T @ d_n
+            dDec_bn   += d_n.sum(axis=0)
+            d_rh       = d_n @ self.Dec_Wn_h.T
+            dDec_Wn_h += (r * h_prev).T @ d_n
+            d_r_post   = d_rh * h_prev
+            dh_prev   += d_rh * r
+            d_inp_from_n = d_n @ self.Dec_Wn_x.T     # grad through prev_out in n
+
+            # r = σ([prev_out, h_prev] @ Dec_Wr + Dec_br)
+            d_r_pre    = d_r_post * r * (1.0 - r)
+            dDec_Wr   += xh.T @ d_r_pre
+            dDec_br   += d_r_pre.sum(axis=0)
+            d_xh_r     = d_r_pre @ self.Dec_Wr.T
+            dh_prev   += d_xh_r[:, N_FEATURES:]
+            d_inp_from_r = d_xh_r[:, :N_FEATURES]
+
+            # z = σ([prev_out, h_prev] @ Dec_Wz + Dec_bz)
+            dDec_Wz   += xh.T @ d_z_pre
+            dDec_bz   += d_z_pre.sum(axis=0)
+            d_xh_z     = d_z_pre @ self.Dec_Wz.T
+            dh_prev   += d_xh_z[:, N_FEATURES:]
+            d_inp_from_z = d_xh_z[:, :N_FEATURES]
+
+            # prev_out gradient — propagates as d_out_{t-1} on next iteration
+            d_prev_out = d_inp_from_n + d_inp_from_r + d_inp_from_z
+            d_h_next   = dh_prev
+
+        # d_h_next after processing t=0 is the gradient w.r.t. h_enc
+        return (d_h_next,
+                dDec_Wr, dDec_br, dDec_Wz, dDec_bz,
+                dDec_Wn_x, dDec_Wn_h, dDec_bn, dWo, dbo)
+
+    # ── Training ─────────────────────────────────────────────────────────────
 
     def train_step(self, x_batch: np.ndarray) -> float:
-        """One SGD step via pure numpy backprop. No TFLite call."""
-        if not self.weights:
-            return float('inf')
-        x = x_batch.astype(np.float32)
-        N = len(self.weights)
+        """One SGD step. x_batch: (batch, 160) flat windows."""
+        x_flat = x_batch.astype(np.float32)
+        x_seq  = x_flat.reshape(-1, WINDOW_SIZE, N_FEATURES)
 
-        # Forward pass — store all activations for backprop
-        act = [x]
-        for i, (w, b) in enumerate(zip(self.weights, self.biases)):
-            z = act[-1] @ w + b
-            act.append(1.0 / (1.0 + np.exp(-z)) if i < N - 1 else z)
+        # Forward
+        h_enc, enc_cache = self._enc_forward(x_seq)
+        recon, dec_cache = self._dec_forward(h_enc)       # (batch, T, F)
 
-        diff = act[-1] - x
+        diff = recon - x_seq
         loss = float(np.mean(diff ** 2))
 
-        # Backward pass (SGD)
-        d = (2.0 / x.shape[0]) * diff
-        for i in reversed(range(N)):
-            dW = act[i].T @ d
-            db = d.sum(axis=0)
-            if i > 0:
-                d = d @ self.weights[i].T   # propagate before weight update
-                s = act[i]
-                d *= s * (1.0 - s)
-            self.weights[i] -= LR * dW
-            self.biases[i]  -= LR * db
+        # Backward
+        d_recon = (2.0 / x_flat.shape[0]) * diff
+        (d_h_enc,
+         dDec_Wr, dDec_br, dDec_Wz, dDec_bz,
+         dDec_Wn_x, dDec_Wn_h, dDec_bn,
+         dWo, dbo)                     = self._dec_backward(d_recon, dec_cache)
+        dWr, dbr, dWz, dbz, dWn_x, dWn_h, dbn = self._enc_backward(d_h_enc, enc_cache)
+
+        with self._lock:
+            self.Wr      -= LR * dWr;      self.br      -= LR * dbr
+            self.Wz      -= LR * dWz;      self.bz      -= LR * dbz
+            self.Wn_x    -= LR * dWn_x;    self.Wn_h    -= LR * dWn_h
+            self.bn      -= LR * dbn
+            self.Dec_Wr  -= LR * dDec_Wr;  self.Dec_br  -= LR * dDec_br
+            self.Dec_Wz  -= LR * dDec_Wz;  self.Dec_bz  -= LR * dDec_bz
+            self.Dec_Wn_x -= LR * dDec_Wn_x; self.Dec_Wn_h -= LR * dDec_Wn_h
+            self.Dec_bn  -= LR * dDec_bn
+            self.Wo      -= LR * dWo;      self.bo      -= LR * dbo
 
         return loss
 
-    # ── Inference (pure numpy — avoids repeated TFLite kwargs memory bug) ────
+    # ── Inference ────────────────────────────────────────────────────────────
 
     def _numpy_forward(self, x: np.ndarray) -> np.ndarray:
-        """Pure numpy forward pass using self.weights/biases."""
-        h = x.reshape(1, INPUT_DIM).astype(np.float32)
-        for i, (w, b) in enumerate(zip(self.weights, self.biases)):
-            z = h @ w + b
-            h = 1.0 / (1.0 + np.exp(-z)) if i < len(self.weights) - 1 else z
-        return h
+        """Forward pass for a single flat (160,) window. Returns flat (160,)."""
+        x_seq = x.reshape(1, WINDOW_SIZE, N_FEATURES).astype(np.float32)
+        with self._lock:
+            h_enc, _  = self._enc_forward(x_seq)
+            recon, _  = self._dec_forward(h_enc)
+        return recon.reshape(1, INPUT_DIM)
 
     def infer(self, x: np.ndarray):
-        """Anomaly detection using pure numpy — no TFLite call."""
-        if not self.weights:
+        """Returns (is_anomaly: bool, score: float). Silent until calibrated."""
+        if not self.calibrated:
             return False, 0.0
-        output = self._numpy_forward(x)
         x_flat = x.reshape(1, INPUT_DIM).astype(np.float32)
+        output = self._numpy_forward(x)
         error  = float(np.mean((x_flat - output) ** 2))
         return error > self.threshold, error
 
-    # ── Numpy checkpointing ───────────────────────────────────────────────────
+    def reconstruction_error(self, x: np.ndarray) -> float:
+        """Raw MSE — used during threshold calibration (bypasses gate)."""
+        x_flat = x.reshape(1, INPUT_DIM).astype(np.float32)
+        output = self._numpy_forward(x)
+        return float(np.mean((x_flat - output) ** 2))
+
+    # ── Threshold calibration ────────────────────────────────────────────────
+
+    def calibrate_threshold(self, normal_errors: list):
+        if len(normal_errors) > 20:
+            t = float(np.percentile(normal_errors, ANOMALY_PERCENTILE))
+            with self._lock:
+                self.threshold  = t
+                self.calibrated = True
+            print(f"[Model] Threshold calibrated: {t:.6f} "
+                  f"(n={len(normal_errors)}, p{ANOMALY_PERCENTILE})")
+
+    # ── Checkpointing (atomic write) ─────────────────────────────────────────
 
     def save_checkpoint(self, name: str = "best") -> str:
-        os.makedirs(CHECKPOINT_DIR, exist_ok=True)
         path = os.path.join(CHECKPOINT_DIR, f"{name}.npz")
-        np.savez(path, *self.weights, *self.biases)
+        tmp  = path + ".tmp"
+        with self._lock:
+            np.savez(tmp,
+                     **{k: getattr(self, k) for k in self._WEIGHT_KEYS},
+                     threshold=np.array([self.threshold]),
+                     calibrated=np.array([int(self.calibrated)]))
+        shutil.move(tmp, path)
         print(f"[Model] Checkpoint saved: {path}")
         return path
 
@@ -208,60 +426,59 @@ class OnDeviceModel:
         if not os.path.exists(path):
             print(f"[Model] No checkpoint at {path}")
             return
-        data   = np.load(path)
-        arrays = [data[k] for k in sorted(data.files)]
-        n = len(self.weights)
-        self.weights = [arrays[i].astype(np.float32) for i in range(n)]
-        self.biases  = [arrays[i+n].astype(np.float32) for i in range(n)]
-        print(f"[Model] Restored: {path}")
+        try:
+            d = np.load(path)
+        except Exception as e:
+            print(f"[Model] Checkpoint corrupt — skipping restore: {e}")
+            return
+        with self._lock:
+            for key in self._WEIGHT_KEYS:
+                if key in d:
+                    setattr(self, key, d[key].astype(np.float32))
+            if 'threshold' in d:
+                self.threshold  = float(d['threshold'][0])
+            if 'calibrated' in d:
+                self.calibrated = bool(d['calibrated'][0])
+        print(f"[Model] Restored from: {path} "
+              f"(calibrated={self.calibrated}, threshold={self.threshold:.6f})")
 
-    # ── FedAvg weight interface ───────────────────────────────────────────────
+    # ── FedAvg interface ─────────────────────────────────────────────────────
 
     def get_weights(self) -> list:
-        """Return [w0,b0,w1,b1,...] for FedAvg. No TFLite call needed."""
-        result = []
-        for w, b in zip(self.weights, self.biases):
-            result.extend([w.copy(), b.copy()])
-        return result
+        """Return list of all weight arrays for FedAvg aggregation."""
+        with self._lock:
+            return [getattr(self, k).copy() for k in self._WEIGHT_KEYS]
 
     def set_weights_from_fedavg(self, flat_list: list):
-        n = len(self.weights)
-        for i in range(n):
-            self.weights[i] = flat_list[i * 2].astype(np.float32)
-            self.biases[i]  = flat_list[i * 2 + 1].astype(np.float32)
-
-    # ── Threshold calibration ─────────────────────────────────────────────────
-
-    def calibrate_threshold(self, normal_errors: list):
-        if len(normal_errors) > 20:
-            self.threshold = float(
-                np.percentile(normal_errors, ANOMALY_PERCENTILE))
-            print(f"[Model] Threshold: {self.threshold:.6f}")
+        if len(flat_list) != len(self._WEIGHT_KEYS):
+            print(f"[Model] FedAvg weight count mismatch "
+                  f"(expected {len(self._WEIGHT_KEYS)}, got {len(flat_list)})")
+            return
+        with self._lock:
+            for key, arr in zip(self._WEIGHT_KEYS, flat_list):
+                setattr(self, key, np.asarray(arr, dtype=np.float32))
+        print("[Model] FedAvg weights applied")
 
 
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 # SECTION 2: Rollback manager
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 
 class RollbackManager:
     """
-    Tracks loss history. If loss worsens for ROLLBACK_PATIENCE consecutive
+    Tracks loss history.  If loss worsens for ROLLBACK_PATIENCE consecutive
     local training cycles, restores the best checkpoint automatically.
     """
 
-    def __init__(self, model: OnDeviceModel):
+    def __init__(self, model: GRUAutoencoder):
         self.model        = model
         self.best_loss    = float('inf')
         self.worse_count  = 0
         self.loss_history = []
 
     def update(self, loss: float, round_label: str) -> bool:
-        """
-        Call after each local training cycle.
-        Returns True if rollback was triggered.
-        """
+        """Returns True if rollback was triggered."""
         self.loss_history.append(loss)
-
         if loss < self.best_loss:
             self.best_loss   = loss
             self.worse_count = 0
@@ -281,30 +498,28 @@ class RollbackManager:
         return False
 
     def is_improving(self) -> bool:
-        """Return True if recent trend is improving (safe to federate)."""
         if len(self.loss_history) < 3:
             return True
         recent = self.loss_history[-3:]
         return recent[-1] <= recent[0]
 
 
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 # SECTION 3: Federation trigger
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 
 class FederationTrigger:
     """
     Decides when to send a weight update to the server.
-    Three conditions:
-      1. Gradient divergence > threshold  → immediate (early trigger)
-      2. Loss spike > 30%                 → immediate (concept drift)
-      3. 6 hours elapsed                  → scheduled (skip if stable)
+      1. Weight divergence > threshold  → immediate
+      2. Loss spike > 30%               → immediate (concept drift)
+      3. 6 hours elapsed                → scheduled (skip if stable)
     """
 
     def __init__(self):
-        self.ref_weights    = None
-        self.ref_loss       = None
-        self.last_fed_time  = time.time()
+        self.ref_weights       = None
+        self.ref_loss          = None
+        self.last_fed_time     = time.time()
         self.adaptive_interval = FED_BASE_INTERVAL
 
     def store_reference(self, weights: list, loss: float):
@@ -313,54 +528,40 @@ class FederationTrigger:
         self.last_fed_time = time.time()
 
     def _divergence(self, current_weights: list) -> float:
-        if self.ref_weights is None or len(self.ref_weights) == 0:
+        if not self.ref_weights:
             return float('inf')
-        total_delta, total_n = 0.0, 0
-        for curr, ref in zip(current_weights, self.ref_weights):
-            total_delta += float(np.sum((curr - ref) ** 2))
-            total_n     += curr.size
+        total_delta = sum(float(np.sum((c - r) ** 2))
+                          for c, r in zip(current_weights, self.ref_weights))
+        total_n     = sum(c.size for c in current_weights)
         return float(np.sqrt(total_delta / max(total_n, 1)))
 
-    def should_federate(self, current_weights: list,
-                        current_loss: float):
-        """
-        Returns (should_federate: bool, reason: str)
-        """
+    def should_federate(self, current_weights: list, current_loss: float):
+        """Returns (should_federate: bool, reason: str)"""
         elapsed    = time.time() - self.last_fed_time
         divergence = self._divergence(current_weights)
-        loss_change = (
-            abs(current_loss - self.ref_loss) / max(self.ref_loss, 1e-8)
-            if self.ref_loss is not None else float('inf')
-        )
+        loss_change = (abs(current_loss - self.ref_loss) / max(self.ref_loss, 1e-8)
+                       if self.ref_loss is not None else float('inf'))
 
-        # Early trigger: significant gradient drift
-        if (divergence > DIVERGENCE_THRESHOLD and
-                elapsed > FED_MIN_INTERVAL):
-            return True, f"gradient_divergence={divergence:.4f}"
-
-        # Early trigger: concept drift (anomaly / new attack pattern)
+        if divergence > DIVERGENCE_THRESHOLD and elapsed > FED_MIN_INTERVAL:
+            return True, f"weight_divergence={divergence:.4f}"
         if loss_change > 0.30 and elapsed > FED_MIN_INTERVAL:
-            self.adaptive_interval = FED_BASE_INTERVAL  # reset
+            self.adaptive_interval = FED_BASE_INTERVAL
             return True, f"concept_drift={loss_change:.2%}"
-
-        # Scheduled trigger
         if elapsed >= self.adaptive_interval:
-            if divergence > 0.01:  # something meaningful to share
+            if divergence > 0.01:
                 return True, "scheduled"
             else:
-                # Model is stable — extend interval, skip round
                 self.adaptive_interval = min(
-                    self.adaptive_interval * 1.5,
-                    FED_BASE_INTERVAL * 3)
+                    self.adaptive_interval * 1.5, FED_BASE_INTERVAL * 3)
                 self.last_fed_time = time.time()
                 return False, "skipped_stable"
+        return False, (f"waiting {elapsed/3600:.1f}h"
+                       f"/{self.adaptive_interval/3600:.1f}h")
 
-        return False, f"waiting {elapsed/3600:.1f}h/{self.adaptive_interval/3600:.1f}h"
 
-
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 # SECTION 4: CAN data collector
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 
 class DataCollector:
     """
@@ -370,25 +571,21 @@ class DataCollector:
 
     FEATURE_NAMES = [
         'speed_kmh', 'battery_level', 'throttle', 'brake',
-        'steering', 'gear', 'location_x', 'location_y',
+        'steering',  'gear',          'location_x', 'location_y',
     ]
 
-    def __init__(self, can_interface: str = 'can0',
-                 buffer_size: int = 2000):
+    def __init__(self, can_interface: str = 'can0', buffer_size: int = 2000):
         self.can_interface = can_interface
         self.buffer        = deque(maxlen=buffer_size)
         self.state         = {n: 0.0 for n in self.FEATURE_NAMES}
         self.running       = False
-
-        # Normalisation stats (fitted after MIN_BUFFER_FRAMES collected)
         self.mean          = np.zeros(N_FEATURES, dtype=np.float32)
         self.std           = np.ones(N_FEATURES,  dtype=np.float32)
         self.scaler_fitted = False
 
     def start(self):
         self.running = True
-        t = threading.Thread(target=self._can_listener, daemon=True)
-        t.start()
+        threading.Thread(target=self._can_listener, daemon=True).start()
         print(f"[DataCollector] Started on {self.can_interface}")
 
     def stop(self):
@@ -397,8 +594,7 @@ class DataCollector:
     def _can_listener(self):
         try:
             import can
-            bus = can.Bus(channel=self.can_interface,
-                          interface='socketcan')
+            bus = can.Bus(channel=self.can_interface, interface='socketcan')
             while self.running:
                 msg = bus.recv(timeout=1.0)
                 if msg:
@@ -411,9 +607,9 @@ class DataCollector:
         cid = msg.arbitration_id
         try:
             v = struct.unpack('<f', msg.data[:4])[0]
-            m = {0x123: 'speed_kmh',    0x124: 'battery_level',
-                 0x125: 'throttle',     0x126: 'brake',
-                 0x127: 'steering',     0x128: 'gear'}
+            m = {0x123: 'speed_kmh',  0x124: 'battery_level',
+                 0x125: 'throttle',   0x126: 'brake',
+                 0x127: 'steering',   0x128: 'gear'}
             if cid in m:
                 self.state[m[cid]] = v
             self._push()
@@ -424,8 +620,8 @@ class DataCollector:
         import random
         while self.running:
             s = self.state
-            s['speed_kmh']     = max(0, s.get('speed_kmh',50) + random.gauss(0,2))
-            s['battery_level'] = max(0, min(100, s.get('battery_level',80) - 0.01))
+            s['speed_kmh']     = max(0, s.get('speed_kmh',     50) + random.gauss(0, 2))
+            s['battery_level'] = max(0, min(100, s.get('battery_level', 80) - 0.01))
             s['throttle']      = max(0, min(1, 0.3 + random.gauss(0, 0.1)))
             s['brake']         = max(0, min(1, abs(random.gauss(0, 0.05))))
             s['steering']      = random.gauss(0, 0.1)
@@ -462,8 +658,7 @@ class DataCollector:
             return None
         if not self.scaler_fitted:
             self.fit_scaler()
-        data = self._normalise(
-            np.array(list(self.buffer), dtype=np.float32))
+        data = self._normalise(np.array(list(self.buffer), dtype=np.float32))
         out  = []
         for i in range(0, min(len(data) - WINDOW_SIZE,
                               max_windows * stride), stride):
@@ -471,7 +666,7 @@ class DataCollector:
         return np.array(out, dtype=np.float32) if out else None
 
     def get_latest_window(self) -> np.ndarray:
-        """Return (160,) most recent window for real-time inference."""
+        """Return (160,) most recent normalised window for inference."""
         if len(self.buffer) < WINDOW_SIZE:
             return None
         if not self.scaler_fitted:
@@ -481,14 +676,12 @@ class DataCollector:
         return data.flatten()
 
 
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 # SECTION 5: Main federated client
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 
 class FederatedClient:
-    """
-    Orchestrates the full federated learning lifecycle on the Pi.
-    """
+    """Orchestrates the full federated learning lifecycle on the Pi."""
 
     def __init__(self, client_id: str, broker: str,
                  port: int = 1883, can_interface: str = 'can0'):
@@ -496,34 +689,39 @@ class FederatedClient:
         self.broker    = broker
         self.port      = port
 
-        # Core components
-        self.model     = OnDeviceModel()
+        self.model     = GRUAutoencoder()
         self.collector = DataCollector(can_interface)
         self.rollback  = RollbackManager(self.model)
         self.trigger   = FederationTrigger()
 
-        # MQTT
-        self.mqtt         = None
-        self.connected    = False
+        self.mqtt          = None
+        self.connected     = False
+        self.current_round = 0
+        self.model_queue   = queue.Queue()
+        self.running       = False
+        self.current_loss  = float('inf')
+        self.normal_errors = deque(maxlen=500)
+        self.phase         = "local_pretraining"
 
-        # State
-        self.current_round    = 0
-        self.model_queue      = queue.Queue()
-        self.running          = False
-        self.last_train_time  = 0.0
-        self.current_loss     = float('inf')
-        self.normal_errors    = deque(maxlen=500)
-        self.phase            = "waiting_for_model"  # lifecycle phase
+        # ── Threading fix ────────────────────────────────────────────────────
+        # A non-blocking lock ensures only ONE _training_cycle runs at a time.
+        # Concurrent spawns (from timer + server trigger) silently drop instead
+        # of piling up and corrupting shared weight arrays.
+        self._train_lock      = threading.Lock()
+        # Set last_train_time to now so first cycle fires after one interval,
+        # not immediately on startup (avoids training before buffer fills).
+        self._last_train_time = time.time()
 
-        # Load any previously saved model from disk
         self._try_load_saved_model()
 
     def _try_load_saved_model(self):
-        path = os.path.join(MODEL_DIR, "current_model.tflite")
-        if os.path.exists(path):
-            if self.model.load_from_file(path):
-                self.phase = "local_pretraining"
-                print("[Client] Loaded saved model from disk")
+        """Restore weights + calibration state from last run."""
+        for name in ("shutdown", "best"):
+            path = os.path.join(CHECKPOINT_DIR, f"{name}.npz")
+            if os.path.exists(path):
+                self.model.restore_checkpoint(name)
+                print(f"[Client] Restored from '{name}' checkpoint")
+                return
 
     # ── MQTT ──────────────────────────────────────────────────────────────────
 
@@ -562,13 +760,10 @@ class FederatedClient:
         print(f"[Client {self.client_id}] Disconnected — will reconnect")
 
     def _on_message(self, client, userdata, message):
-        topic = message.topic
         try:
-            if topic == "federated/model/global":
-                data = pickle.loads(message.payload)
-                self.model_queue.put(data)
-
-            elif topic == "federated/aggregation/trigger":
+            if message.topic == "federated/model/global":
+                self.model_queue.put(pickle.loads(message.payload))
+            elif message.topic == "federated/aggregation/trigger":
                 print(f"[Client {self.client_id}] Server requested training round")
                 threading.Thread(target=self._training_cycle,
                                  daemon=True).start()
@@ -590,53 +785,47 @@ class FederatedClient:
     # ── Apply global model ────────────────────────────────────────────────────
 
     def _apply_global_model(self, data: dict):
-        """Load new .tflite from server and update weights."""
-        round_num    = data.get("round", self.current_round + 1)
-        tflite_bytes = data.get("tflite_bytes")
-        dims         = data.get("dims", None)
-
-        if tflite_bytes is None:
-            print("[Client] Global model payload missing tflite_bytes")
-            return
-
-        print(f"[Client] Applying global model from round {round_num}...")
-
-        # If server sent averaged weights (FedAvg round), apply them first
+        """Apply FedAvg-averaged weights (and optionally validate tflite file)."""
+        round_num      = data.get("round", self.current_round + 1)
         fedavg_weights = data.get("fedavg_weights")
+        tflite_bytes   = data.get("tflite_bytes")
+
         if fedavg_weights is not None:
             self.model.set_weights_from_fedavg(fedavg_weights)
 
-        if self.model.load_from_bytes(tflite_bytes, dims):
-            self.current_round = round_num
-            self.phase         = "local_pretraining"
-            weights = self.model.get_weights()
-            if weights:
-                self.trigger.store_reference(weights, self.current_loss)
-            print(f"[Client] Global model applied ✓ (round {round_num})")
-        else:
-            print("[Client] Failed to load global model")
+        # Validate the tflite file with TFLite runtime if server sent one
+        if tflite_bytes is not None:
+            self.model.load_from_bytes(tflite_bytes)
+
+        self.current_round = round_num
+        self.phase         = "local_pretraining"
+        self.trigger.store_reference(self.model.get_weights(), self.current_loss)
+        print(f"[Client] Global model applied ✓ (round {round_num})")
 
     # ── Training cycle ────────────────────────────────────────────────────────
 
     def _training_cycle(self):
         """
-        One full local training cycle:
-          1. Get windows from CAN buffer
-          2. Run LOCAL_EPOCHS of mini-batch training
-          3. Rollback check
-          4. Federation trigger check → send weights if triggered
-          5. Calibrate anomaly threshold
+        Outer wrapper: acquires non-blocking lock so concurrent calls
+        (from timer and server trigger) are silently dropped.
         """
-        if not self.model.is_loaded:
-            print("[Client] No model loaded yet — skipping training")
-            return
+        if not self._train_lock.acquire(blocking=False):
+            return   # another cycle is already running — skip
+        try:
+            self._run_training()
+        except Exception as e:
+            print(f"[Client] Training error: {e}")
+        finally:
+            self._train_lock.release()
+            self._last_train_time = time.time()
+
+    def _run_training(self):
         if not self.collector.ready():
             print(f"[Client] Buffer not ready "
                   f"({len(self.collector.buffer)}/{MIN_BUFFER_FRAMES} frames)")
             return
 
         self._publish_status("training")
-
         windows = self.collector.get_windows(stride=5)
         if windows is None:
             self._publish_status("idle")
@@ -645,13 +834,12 @@ class FederatedClient:
         # ── Local training ────────────────────────────────────────────────
         losses = []
         for _ in range(LOCAL_EPOCHS):
-            idx  = np.random.permutation(len(windows))
+            idx = np.random.permutation(len(windows))
             for i in range(0, len(windows), BATCH_SIZE):
                 batch = windows[idx[i:i + BATCH_SIZE]]
                 if len(batch) == 0:
                     continue
-                loss = self.model.train_step(batch)
-                losses.append(loss)
+                losses.append(self.model.train_step(batch))
 
         avg_loss = float(np.mean(losses)) if losses else float('inf')
         self.current_loss = avg_loss
@@ -660,17 +848,14 @@ class FederatedClient:
               f"windows={len(windows)}, phase={self.phase}")
 
         # ── Rollback check ────────────────────────────────────────────────
-        rolled_back = self.rollback.update(avg_loss, f"round_{self.current_round}")
-        if rolled_back:
+        if self.rollback.update(avg_loss, f"round_{self.current_round}"):
             self._publish_status("rolled_back")
-            # Do NOT send weights after rollback — weights are reverted
-            return
+            return   # weights reverted — don't federate
 
         # ── Federation trigger ────────────────────────────────────────────
         current_weights = self.model.get_weights()
         should_fed, reason = self.trigger.should_federate(
             current_weights, avg_loss)
-
         if should_fed and self.rollback.is_improving():
             self._send_weight_update(current_weights, avg_loss, len(windows))
             self.trigger.store_reference(current_weights, avg_loss)
@@ -678,57 +863,58 @@ class FederatedClient:
             print(f"[Client] Federation: {reason}")
 
         # ── Threshold calibration ─────────────────────────────────────────
-        sample_windows = windows[:100]
-        for w in sample_windows:
-            _, err = self.model.infer(w)
-            self.normal_errors.append(err)
+        # Collect reconstruction errors on normal training data.
+        # Uses raw error (bypasses calibration gate) so we can gather
+        # enough data to set the threshold for the first time.
+        for w in windows[:100]:
+            self.normal_errors.append(self.model.reconstruction_error(w))
         self.model.calibrate_threshold(list(self.normal_errors))
 
         self._publish_status("idle")
-        self.last_train_time = time.time()
 
     def _send_weight_update(self, weights: list, loss: float,
                              num_samples: int):
-        """
-        Send weight arrays (NOT raw data) to server for FedAvg.
-        This is the only thing the server ever receives from the Pi.
-        """
+        """Send GRU weight arrays (NOT raw CAN data) to server for FedAvg."""
         if not self.connected:
-            print("[Client] Not connected — weight update queued for next connection")
+            print("[Client] Not connected — weight update skipped")
             return
-
         payload = pickle.dumps({
             "client_id":   self.client_id,
             "round":       self.current_round,
-            "weights":     weights,          # list of np.ndarray
+            "weights":     weights,
             "num_samples": num_samples,
             "loss":        loss,
             "timestamp":   time.time(),
         })
         self.mqtt.publish("federated/model/updates", payload, qos=1)
-        print(f"[Client {self.client_id}] "
-              f"Sent weight update: "
-              f"round={self.current_round}, "
-              f"loss={loss:.6f}, "
-              f"samples={num_samples}, "
-              f"size={len(payload)/1024:.1f} KB")
+        print(f"[Client {self.client_id}] Sent weight update: "
+              f"round={self.current_round}, loss={loss:.6f}, "
+              f"samples={num_samples}, size={len(payload)/1024:.1f} KB")
 
-    # ── Anomaly detection (real-time, every 100ms) ────────────────────────────
+    # ── Anomaly detection ────────────────────────────────────────────────────
 
     def _detect_anomaly(self):
+        """
+        Runs every 100ms in the main loop.
+        Silent during pretraining (calibrated=False) — no false positives.
+        """
+        if not self.model.calibrated:
+            return
         window = self.collector.get_latest_window()
-        if window is None or not self.model.is_loaded:
+        if window is None:
             return
         is_anomaly, score = self.model.infer(window)
         if is_anomaly:
-            print(f"[Client {self.client_id}] ⚠️  ANOMALY: score={score:.6f}")
-            self.mqtt.publish("federated/alerts/attack", json.dumps({
-                "client_id": self.client_id,
-                "score":     score,
-                "threshold": self.model.threshold,
-                "round":     self.current_round,
-                "timestamp": time.time(),
-            }))
+            print(f"[Client {self.client_id}] ⚠️  ANOMALY detected: "
+                  f"score={score:.6f} (threshold={self.model.threshold:.6f})")
+            if self.connected:
+                self.mqtt.publish("federated/alerts/attack", json.dumps({
+                    "client_id": self.client_id,
+                    "score":     score,
+                    "threshold": self.model.threshold,
+                    "round":     self.current_round,
+                    "timestamp": time.time(),
+                }))
 
     # ── Main loop ─────────────────────────────────────────────────────────────
 
@@ -737,44 +923,43 @@ class FederatedClient:
         print(f"FEDERATED IDS CLIENT — {self.client_id}")
         print(f"  Broker        : {self.broker}:{self.port}")
         print(f"  CAN interface : {self.collector.can_interface}")
-        print(f"  Fed interval  : {FED_BASE_INTERVAL/3600:.0f}h (base)")
+        print(f"  Model         : GRU({GRU_HIDDEN}) autoencoder  [pure numpy]")
+        print(f"  TFLite        : {'available' if TFLITE_OK else 'not found'}"
+              f"  [used for file validation only]")
+        print(f"  Fed interval  : {FED_BASE_INTERVAL/3600:.0f}h base")
         print("=" * 60)
 
         self.collector.start()
         self.connect()
         time.sleep(2)
         self.running = True
-
-        inference_tick = 0
+        log_tick = 0
 
         try:
             while self.running:
-
-                # ── Apply any received global models ──────────────────────
+                # Apply any received global model updates
                 try:
-                    model_data = self.model_queue.get_nowait()
-                    self._apply_global_model(model_data)
+                    self._apply_global_model(self.model_queue.get_nowait())
                 except queue.Empty:
                     pass
 
-                # ── Periodic local training ───────────────────────────────
-                now = time.time()
-                if (now - self.last_train_time >= LOCAL_TRAIN_INTERVAL and
-                        self.model.is_loaded and
-                        self.collector.ready()):
+                # Periodic local training (lock ensures only one runs at a time)
+                if (time.time() - self._last_train_time >= LOCAL_TRAIN_INTERVAL
+                        and self.collector.ready()):
                     threading.Thread(target=self._training_cycle,
                                      daemon=True).start()
 
-                # ── Real-time anomaly detection (every 100ms) ─────────────
+                # Real-time anomaly detection (every 100ms, gated on calibration)
                 self._detect_anomaly()
 
-                # ── Phase logging (every ~30s) ────────────────────────────
-                inference_tick += 1
-                if inference_tick % 300 == 0:
+                # Status log every ~30s
+                log_tick += 1
+                if log_tick % 300 == 0:
                     print(f"[Client {self.client_id}] "
                           f"phase={self.phase} | "
                           f"round={self.current_round} | "
                           f"loss={self.current_loss:.6f} | "
+                          f"calibrated={self.model.calibrated} | "
                           f"buffer={len(self.collector.buffer)}")
 
                 time.sleep(0.1)
@@ -782,7 +967,6 @@ class FederatedClient:
         except KeyboardInterrupt:
             print(f"\n[Client {self.client_id}] Shutting down...")
         finally:
-            # Save model on exit so it survives reboot
             self.model.save_checkpoint("shutdown")
             self.collector.stop()
             if self.mqtt:
@@ -796,21 +980,19 @@ class FederatedClient:
 def main():
     import argparse
     p = argparse.ArgumentParser(description="Federated IDS Edge Client")
-    p.add_argument("--client-id",      default="edge_1",
-                   help="Unique ID for this Pi (e.g. edge_1, edge_2, edge_3)")
-    p.add_argument("--broker",         required=True,
+    p.add_argument("--client-id",     default="edge_1")
+    p.add_argument("--broker",        required=True,
                    help="MQTT broker IP (Windows server IP)")
-    p.add_argument("--port",           type=int, default=1883)
-    p.add_argument("--can-interface",  default="can0")
+    p.add_argument("--port",          type=int, default=1883)
+    p.add_argument("--can-interface", default="can0")
     args = p.parse_args()
 
-    client = FederatedClient(
+    FederatedClient(
         client_id=args.client_id,
         broker=args.broker,
         port=args.port,
         can_interface=args.can_interface,
-    )
-    client.run()
+    ).run()
 
 
 if __name__ == "__main__":
