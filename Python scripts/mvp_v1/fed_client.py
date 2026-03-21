@@ -120,7 +120,11 @@ class OnDeviceModel:
         if not TFLITE_OK or not os.path.exists(path):
             return False
         try:
-            self.interpreter  = tflite.Interpreter(model_path=path)
+            self.interpreter  = tflite.Interpreter(
+                model_path=path,
+                experimental_options={"TFLITE_DISABLE_XNNPACK": True},
+                num_threads=1,
+            )
             self.interpreter.allocate_tensors()
             self.train_runner = self.interpreter.get_signature_runner('train')
             self.infer_runner = self.interpreter.get_signature_runner('infer')
@@ -159,7 +163,11 @@ class OnDeviceModel:
         """
         path = os.path.join(MODEL_DIR, "current_model.tflite")
         if os.path.exists(path):
-            self.interpreter  = tflite.Interpreter(model_path=path)
+            self.interpreter  = tflite.Interpreter(
+                model_path=path,
+                experimental_options={"TFLITE_DISABLE_XNNPACK": True},
+                num_threads=1,
+            )
             self.interpreter.allocate_tensors()
             self.train_runner = self.interpreter.get_signature_runner('train')
             self.infer_runner = self.interpreter.get_signature_runner('infer')
