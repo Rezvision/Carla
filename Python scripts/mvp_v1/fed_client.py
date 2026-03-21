@@ -28,6 +28,7 @@ Requirements (Raspberry Pi):
 """
 
 import os
+os.environ["TFLITE_DISABLE_XNNPACK"] = "1"   # must be set before tflite import
 import json
 import time
 import struct
@@ -122,7 +123,6 @@ class OnDeviceModel:
         try:
             self.interpreter  = tflite.Interpreter(
                 model_path=path,
-                experimental_options={"TFLITE_DISABLE_XNNPACK": True},
                 num_threads=1,
             )
             self.interpreter.allocate_tensors()
@@ -165,7 +165,6 @@ class OnDeviceModel:
         if os.path.exists(path):
             self.interpreter  = tflite.Interpreter(
                 model_path=path,
-                experimental_options={"TFLITE_DISABLE_XNNPACK": True},
                 num_threads=1,
             )
             self.interpreter.allocate_tensors()
