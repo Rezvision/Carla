@@ -128,6 +128,11 @@ class GRUAutoencoder:
         'Wo',     'bo',                          # output projection
     )
 
+    # Adam hyperparameters
+    _BETA1 = 0.9
+    _BETA2 = 0.999
+    _EPS   = 1e-8
+
     def __init__(self):
         self.threshold  = float('inf')
         self.calibrated = False
@@ -135,6 +140,7 @@ class GRUAutoencoder:
         self._lock      = threading.Lock()
         self._tflite_interp = None
         self._init_weights()
+        self._init_adam()
 
     # ── Weight init ──────────────────────────────────────────────────────────
 
@@ -160,6 +166,31 @@ class GRUAutoencoder:
 
         # Output projection: hidden → one reconstructed frame
         self.Wo = w(H, F); self.bo = b(F)
+
+    # ── Adam optimiser ───────────────────────────────────────────────────────
+
+    def _init_adam(self):
+        """Zero first/second moment buffers for all weight matrices."""
+        self._adam_m = {k: np.zeros_like(getattr(self, k)) for k in self._WEIGHT_KEYS}
+        self._adam_v = {k: np.zeros_like(getattr(self, k)) for k in self._WEIGHT_KEYS}
+        self._adam_t = 0
+
+    def _adam_step(self, grads: dict):
+        """
+        Adam update for every key in grads.  Must be called inside self._lock.
+        grads: {weight_key: gradient_array}
+        """
+        self._adam_t += 1
+        t   = self._adam_t
+        bc1 = 1.0 - self._BETA1 ** t
+        bc2 = 1.0 - self._BETA2 ** t
+        for k, g in grads.items():
+            self._adam_m[k] = self._BETA1 * self._adam_m[k] + (1 - self._BETA1) * g
+            self._adam_v[k] = self._BETA2 * self._adam_v[k] + (1 - self._BETA2) * (g ** 2)
+            m_hat = self._adam_m[k] / bc1
+            v_hat = self._adam_v[k] / bc2
+            w = getattr(self, k)
+            w -= LR * m_hat / (np.sqrt(v_hat) + self._EPS)
 
     # ── TFLite file validation (weights stay numpy) ───────────────────────────
 
@@ -262,18 +293,45 @@ class GRUAutoencoder:
             dh = dh_prev
         return dWr, dbr, dWz, dbz, dWn_x, dWn_h, dbn
 
-    # ── Decoder backward (BPTT) ──────────────────────────────────────────────
+    # ── Decoder forward — teacher-forced (training only) ─────────────────────
 
-    def _dec_backward(self, d_recon, cache):
+    def _dec_forward_train(self, h_enc: np.ndarray, x_seq: np.ndarray):
         """
-        d_recon: (batch, WINDOW_SIZE, F) — gradient from MSE loss.
-        Returns d_h_enc (connects back into encoder) + decoder weight grads.
+        Teacher-forced decoder for training.
+        Input at step t = actual frame x_seq[:,t-1,:] (zeros at t=0).
+        This gives a clean, independent gradient at every timestep — no error
+        compounding across steps, which makes BPTT well-conditioned.
+        Used only during train_step; inference always uses _dec_forward (free-run).
+        """
+        batch = h_enc.shape[0]
+        h     = h_enc.copy()
+        outputs, cache = [], []
+        for t in range(WINDOW_SIZE):
+            prev_in = (np.zeros((batch, N_FEATURES), dtype=np.float32)
+                       if t == 0 else x_seq[:, t - 1, :])
+            xh    = np.concatenate([prev_in, h], axis=1)
+            r     = _sig(xh @ self.Dec_Wr + self.Dec_br)
+            z     = _sig(xh @ self.Dec_Wz + self.Dec_bz)
+            n     = np.tanh(prev_in @ self.Dec_Wn_x
+                            + (r * h) @ self.Dec_Wn_h + self.Dec_bn)
+            h_new = (1.0 - z) * h + z * n
+            out_t = h_new @ self.Wo + self.bo
+            cache.append((prev_in, h, xh, r, z, n, h_new))
+            outputs.append(out_t)
+            h = h_new
+        return np.stack(outputs, axis=1), cache    # (batch, T, F)
 
-        At each step t the gradient has two sources:
-          1. Direct loss on out_t  (d_recon[:, t, :])
-          2. d_prev_out from step t+1 — because out_t is fed as input to t+1
+    # ── Decoder backward — teacher-forced BPTT ───────────────────────────────
+
+    def _dec_backward_tf(self, d_recon, cache):
         """
-        batch = d_recon.shape[0]
+        Backward through the teacher-forced decoder.
+        prev_in at each step is ground-truth data, so its gradient is discarded —
+        d_prev_out does NOT accumulate across timesteps.  Only d_h flows back.
+        This is what makes the gradient signal per-timestep instead of entangled.
+        Returns d_h_enc (passed into encoder backward) + all decoder weight grads.
+        """
+        batch    = d_recon.shape[0]
         dDec_Wr  = np.zeros_like(self.Dec_Wr)
         dDec_Wz  = np.zeros_like(self.Dec_Wz)
         dDec_Wn_x = np.zeros_like(self.Dec_Wn_x)
@@ -283,55 +341,39 @@ class GRUAutoencoder:
         dDec_bn  = np.zeros_like(self.Dec_bn)
         dWo      = np.zeros_like(self.Wo)
         dbo      = np.zeros_like(self.bo)
-
-        d_h_next   = np.zeros((batch, GRU_HIDDEN), dtype=np.float32)
-        d_prev_out = np.zeros((batch, N_FEATURES),  dtype=np.float32)
+        d_h_next = np.zeros((batch, GRU_HIDDEN), dtype=np.float32)
 
         for t in reversed(range(WINDOW_SIZE)):
-            prev_out, h_prev, xh, r, z, n, h_new = cache[t]
+            prev_in, h_prev, xh, r, z, n, h_new = cache[t]
 
-            # Total gradient on out_t: from loss + from being used as next input
-            d_out_t = d_recon[:, t, :] + d_prev_out
-
-            # out_t = h_new @ Wo + bo
+            # Loss gradient at this timestep only — no chained d_prev_out
+            d_out_t = d_recon[:, t, :]
             dWo    += h_new.T @ d_out_t
             dbo    += d_out_t.sum(axis=0)
             d_h_new = d_out_t @ self.Wo.T + d_h_next
 
-            # h_new = (1-z)*h_prev + z*n
             dh_prev  = d_h_new * (1.0 - z)
             d_z_pre  = d_h_new * (n - h_prev) * z * (1.0 - z)
             d_n      = d_h_new * z * (1.0 - n ** 2)
 
-            # n = tanh(prev_out @ Dec_Wn_x + (r*h_prev) @ Dec_Wn_h + Dec_bn)
-            dDec_Wn_x += prev_out.T @ d_n
+            dDec_Wn_x += prev_in.T @ d_n
             dDec_bn   += d_n.sum(axis=0)
             d_rh       = d_n @ self.Dec_Wn_h.T
             dDec_Wn_h += (r * h_prev).T @ d_n
-            d_r_post   = d_rh * h_prev
             dh_prev   += d_rh * r
-            d_inp_from_n = d_n @ self.Dec_Wn_x.T     # grad through prev_out in n
+            d_r_pre    = d_rh * h_prev * r * (1.0 - r)
 
-            # r = σ([prev_out, h_prev] @ Dec_Wr + Dec_br)
-            d_r_pre    = d_r_post * r * (1.0 - r)
             dDec_Wr   += xh.T @ d_r_pre
             dDec_br   += d_r_pre.sum(axis=0)
-            d_xh_r     = d_r_pre @ self.Dec_Wr.T
-            dh_prev   += d_xh_r[:, N_FEATURES:]
-            d_inp_from_r = d_xh_r[:, :N_FEATURES]
+            dh_prev   += (d_r_pre @ self.Dec_Wr.T)[:, N_FEATURES:]
+            # input-dimension grad discarded — prev_in is ground truth, not network output
 
-            # z = σ([prev_out, h_prev] @ Dec_Wz + Dec_bz)
             dDec_Wz   += xh.T @ d_z_pre
             dDec_bz   += d_z_pre.sum(axis=0)
-            d_xh_z     = d_z_pre @ self.Dec_Wz.T
-            dh_prev   += d_xh_z[:, N_FEATURES:]
-            d_inp_from_z = d_xh_z[:, :N_FEATURES]
+            dh_prev   += (d_z_pre @ self.Dec_Wz.T)[:, N_FEATURES:]
 
-            # prev_out gradient — propagates as d_out_{t-1} on next iteration
-            d_prev_out = d_inp_from_n + d_inp_from_r + d_inp_from_z
-            d_h_next   = dh_prev
+            d_h_next = dh_prev
 
-        # d_h_next after processing t=0 is the gradient w.r.t. h_enc
         return (d_h_next,
                 dDec_Wr, dDec_br, dDec_Wz, dDec_bz,
                 dDec_Wn_x, dDec_Wn_h, dDec_bn, dWo, dbo)
@@ -339,13 +381,16 @@ class GRUAutoencoder:
     # ── Training ─────────────────────────────────────────────────────────────
 
     def train_step(self, x_batch: np.ndarray) -> float:
-        """One SGD step. x_batch: (batch, 160) flat windows."""
+        """
+        One Adam step with teacher-forced decoder.
+        x_batch: (batch, 160) flat windows.
+        """
         x_flat = x_batch.astype(np.float32)
         x_seq  = x_flat.reshape(-1, WINDOW_SIZE, N_FEATURES)
 
-        # Forward
+        # Forward — teacher forcing during training
         h_enc, enc_cache = self._enc_forward(x_seq)
-        recon, dec_cache = self._dec_forward(h_enc)       # (batch, T, F)
+        recon, dec_cache = self._dec_forward_train(h_enc, x_seq)   # (batch, T, F)
 
         diff = recon - x_seq
         loss = float(np.mean(diff ** 2))
@@ -355,19 +400,20 @@ class GRUAutoencoder:
         (d_h_enc,
          dDec_Wr, dDec_br, dDec_Wz, dDec_bz,
          dDec_Wn_x, dDec_Wn_h, dDec_bn,
-         dWo, dbo)                     = self._dec_backward(d_recon, dec_cache)
-        dWr, dbr, dWz, dbz, dWn_x, dWn_h, dbn = self._enc_backward(d_h_enc, enc_cache)
+         dWo, dbo)                               = self._dec_backward_tf(d_recon, dec_cache)
+        dWr, dbr, dWz, dbz, dWn_x, dWn_h, dbn  = self._enc_backward(d_h_enc, enc_cache)
 
+        # Adam update
         with self._lock:
-            self.Wr      -= LR * dWr;      self.br      -= LR * dbr
-            self.Wz      -= LR * dWz;      self.bz      -= LR * dbz
-            self.Wn_x    -= LR * dWn_x;    self.Wn_h    -= LR * dWn_h
-            self.bn      -= LR * dbn
-            self.Dec_Wr  -= LR * dDec_Wr;  self.Dec_br  -= LR * dDec_br
-            self.Dec_Wz  -= LR * dDec_Wz;  self.Dec_bz  -= LR * dDec_bz
-            self.Dec_Wn_x -= LR * dDec_Wn_x; self.Dec_Wn_h -= LR * dDec_Wn_h
-            self.Dec_bn  -= LR * dDec_bn
-            self.Wo      -= LR * dWo;      self.bo      -= LR * dbo
+            self._adam_step({
+                'Wr': dWr,      'br': dbr,
+                'Wz': dWz,      'bz': dbz,
+                'Wn_x': dWn_x,  'Wn_h': dWn_h,  'bn': dbn,
+                'Dec_Wr': dDec_Wr,   'Dec_br': dDec_br,
+                'Dec_Wz': dDec_Wz,   'Dec_bz': dDec_bz,
+                'Dec_Wn_x': dDec_Wn_x, 'Dec_Wn_h': dDec_Wn_h, 'Dec_bn': dDec_bn,
+                'Wo': dWo,      'bo': dbo,
+            })
 
         return loss
 
@@ -411,7 +457,9 @@ class GRUAutoencoder:
 
     def save_checkpoint(self, name: str = "best") -> str:
         path = os.path.join(CHECKPOINT_DIR, f"{name}.npz")
-        tmp  = path + ".tmp"
+        # np.savez appends .npz automatically when the path doesn't end in .npz.
+        # Use a tmp name that already ends in .npz so the rename target is exact.
+        tmp  = os.path.join(CHECKPOINT_DIR, f"{name}_tmp.npz")
         with self._lock:
             np.savez(tmp,
                      **{k: getattr(self, k) for k in self._WEIGHT_KEYS},
@@ -439,6 +487,7 @@ class GRUAutoencoder:
                 self.threshold  = float(d['threshold'][0])
             if 'calibrated' in d:
                 self.calibrated = bool(d['calibrated'][0])
+        self._init_adam()   # stale moments are wrong after weight change
         print(f"[Model] Restored from: {path} "
               f"(calibrated={self.calibrated}, threshold={self.threshold:.6f})")
 
@@ -457,6 +506,7 @@ class GRUAutoencoder:
         with self._lock:
             for key, arr in zip(self._WEIGHT_KEYS, flat_list):
                 setattr(self, key, np.asarray(arr, dtype=np.float32))
+        self._init_adam()   # reset moments — averaged weights shift the loss landscape
         print("[Model] FedAvg weights applied")
 
 
@@ -579,6 +629,8 @@ class DataCollector:
         self.buffer        = deque(maxlen=buffer_size)
         self.state         = {n: 0.0 for n in self.FEATURE_NAMES}
         self.running       = False
+        self.frame_count      = 0
+        self.last_count_reset = time.time()
         self.mean          = np.zeros(N_FEATURES, dtype=np.float32)
         self.std           = np.ones(N_FEATURES,  dtype=np.float32)
         self.scaler_fitted = False
@@ -635,6 +687,7 @@ class DataCollector:
         row = np.array([self.state.get(n, 0.0)
                         for n in self.FEATURE_NAMES], dtype=np.float32)
         self.buffer.append(row)
+        self.frame_count += 1
 
     def fit_scaler(self):
         if len(self.buffer) < 50:
@@ -955,12 +1008,18 @@ class FederatedClient:
                 # Status log every ~30s
                 log_tick += 1
                 if log_tick % 300 == 0:
+                    _now     = time.time()
+                    _elapsed = _now - self.collector.last_count_reset
+                    _fps     = self.collector.frame_count / max(_elapsed, 1)
+                    self.collector.frame_count      = 0
+                    self.collector.last_count_reset = _now
                     print(f"[Client {self.client_id}] "
                           f"phase={self.phase} | "
                           f"round={self.current_round} | "
                           f"loss={self.current_loss:.6f} | "
                           f"calibrated={self.model.calibrated} | "
-                          f"buffer={len(self.collector.buffer)}")
+                          f"buffer={len(self.collector.buffer)} | "
+                          f"can_fps={_fps:.1f}")
 
                 time.sleep(0.1)
 
