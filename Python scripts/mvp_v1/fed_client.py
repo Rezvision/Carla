@@ -61,6 +61,7 @@ LOCAL_TRAIN_INTERVAL = 300        # seconds between local training cycles
 MIN_BUFFER_FRAMES    = 200        # minimum CAN frames before first training
 LOCAL_EPOCHS         = 3          # epochs per local training cycle
 BATCH_SIZE           = 32
+LR                   = 0.001      # SGD learning rate for numpy train step
 ANOMALY_PERCENTILE   = 97         # threshold calibration
 ROLLBACK_PATIENCE    = 3          # rounds of worsening before rollback
 FED_BASE_INTERVAL    = 21600      # 6 hours scheduled federation
@@ -142,34 +143,37 @@ class OnDeviceModel:
             kw[f'b{i}'] = b
         return kw
 
-    # ── Training ─────────────────────────────────────────────────────────────
+    # ── Training (pure numpy — eliminates TFLite C++ memory corruption) ──────
 
     def train_step(self, x_batch: np.ndarray) -> float:
-        """One SGD step via TFLite train signature."""
-        if not self.is_loaded:
+        """One SGD step via pure numpy backprop. No TFLite call."""
+        if not self.weights:
             return float('inf')
-        kw     = self._weight_kwargs()
-        result = self.train_runner(x=x_batch.astype(np.float32), **kw)
-        for i in range(len(self.weights)):
-            self.weights[i] = result[f'w{i}'].copy()
-            self.biases[i]  = result[f'b{i}'].copy()
-        return float(result['loss'])
+        x = x_batch.astype(np.float32)
+        N = len(self.weights)
 
-    def reload_interpreter(self):
-        """
-        Reload the TFLite interpreter from disk to clear accumulated
-        memory state. Call between training epochs on tflite-runtime 2.14
-        to prevent double-free corruption from repeated kwargs calls.
-        """
-        path = os.path.join(MODEL_DIR, "current_model.tflite")
-        if os.path.exists(path):
-            self.interpreter  = tflite.Interpreter(
-                model_path=path,
-                num_threads=1,
-            )
-            self.interpreter.allocate_tensors()
-            self.train_runner = self.interpreter.get_signature_runner('train')
-            self.infer_runner = self.interpreter.get_signature_runner('infer')
+        # Forward pass — store all activations for backprop
+        act = [x]
+        for i, (w, b) in enumerate(zip(self.weights, self.biases)):
+            z = act[-1] @ w + b
+            act.append(1.0 / (1.0 + np.exp(-z)) if i < N - 1 else z)
+
+        diff = act[-1] - x
+        loss = float(np.mean(diff ** 2))
+
+        # Backward pass (SGD)
+        d = (2.0 / x.shape[0]) * diff
+        for i in reversed(range(N)):
+            dW = act[i].T @ d
+            db = d.sum(axis=0)
+            if i > 0:
+                d = d @ self.weights[i].T   # propagate before weight update
+                s = act[i]
+                d *= s * (1.0 - s)
+            self.weights[i] -= LR * dW
+            self.biases[i]  -= LR * db
+
+        return loss
 
     # ── Inference (pure numpy — avoids repeated TFLite kwargs memory bug) ────
 
@@ -640,11 +644,7 @@ class FederatedClient:
 
         # ── Local training ────────────────────────────────────────────────
         losses = []
-        for epoch in range(LOCAL_EPOCHS):
-            # Reload interpreter between epochs to clear tflite-runtime
-            # 2.14 memory state — prevents double-free corruption
-            if epoch > 0:
-                self.model.reload_interpreter()
+        for _ in range(LOCAL_EPOCHS):
             idx  = np.random.permutation(len(windows))
             for i in range(0, len(windows), BATCH_SIZE):
                 batch = windows[idx[i:i + BATCH_SIZE]]
@@ -652,8 +652,6 @@ class FederatedClient:
                     continue
                 loss = self.model.train_step(batch)
                 losses.append(loss)
-        # Reload once more after training to reset interpreter state
-        self.model.reload_interpreter()
 
         avg_loss = float(np.mean(losses)) if losses else float('inf')
         self.current_loss = avg_loss
