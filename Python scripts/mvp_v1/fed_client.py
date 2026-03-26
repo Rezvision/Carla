@@ -31,16 +31,13 @@ Model (seq2seq GRU autoencoder):
   Training: pure numpy BPTT through encoder + decoder (no TFLite C++)
   Infer   : pure numpy forward pass
 
-TFLite runtime is kept for:
-  - Loading / validating .tflite model files received from server
-  - Future: GRU TFLite model for inference acceleration
 
 Requirements (Raspberry Pi):
-  pip install tflite-runtime paho-mqtt numpy python-can
+  pip install paho-mqtt numpy python-can
 """
 
 import os
-os.environ["TFLITE_DISABLE_XNNPACK"] = "1"   # before tflite import
+# os.environ["TFLITE_DISABLE_XNNPACK"] = "1"   # before tflite import
 import json
 import time
 import struct
@@ -53,17 +50,17 @@ from collections import deque
 
 import paho.mqtt.client as mqtt
 
-# ── TFLite import (optional, kept for model file validation) ──────────────────
-try:
-    import tflite_runtime.interpreter as tflite
-    TFLITE_OK = True
-except ImportError:
-    try:
-        import tensorflow.lite as tflite
-        TFLITE_OK = True
-    except ImportError:
-        print("[Warning] tflite-runtime not found — model file validation disabled")
-        TFLITE_OK = False
+# # ── TFLite import (optional, kept for model file validation) ──────────────────
+# try:
+#     import tflite_runtime.interpreter as tflite
+#     TFLITE_OK = True
+# except ImportError:
+#     try:
+#         import tensorflow.lite as tflite
+#         TFLITE_OK = True
+#     except ImportError:
+#         print("[Warning] tflite-runtime not found — model file validation disabled")
+#         TFLITE_OK = False
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 INPUT_DIM            = 160        # WINDOW_SIZE × N_FEATURES (flat)
@@ -75,7 +72,9 @@ MIN_BUFFER_FRAMES    = 200       # min CAN frames before first training
 LOCAL_EPOCHS         = 3         # epochs per local training cycle
 BATCH_SIZE           = 32
 LR                   = 0.001     # SGD learning rate
-ANOMALY_PERCENTILE   = 97        # percentile used for threshold calibration
+ANOMALY_PERCENTILE   = 99        # percentile used for threshold calibration
+ANOMALY_SAFETY_MULT  = 1.5       # multiply p99 threshold by this — extra headroom
+GRAD_CLIP_NORM       = 5.0       # global gradient norm clip (prevents score explosion)
 ROLLBACK_PATIENCE    = 3         # consecutive worsening rounds before rollback
 FED_BASE_INTERVAL    = 21600     # 6 hours base federation interval
 FED_MIN_INTERVAL     = 1800      # 30 min minimum between federation rounds
@@ -113,8 +112,7 @@ class GRUAutoencoder:
       • Symmetric architecture; encoder and decoder share the same inductive bias
       • More sensitive to temporal pattern deviations (e.g. sudden CAN floods)
 
-    TFLite runtime is kept for .tflite file validation when the server sends
-    a model update.  All compute (train + infer) is pure numpy.
+    
     """
 
     # Encoder weights (7)  +  decoder weights (9)  =  16 total
@@ -138,7 +136,7 @@ class GRUAutoencoder:
         self.calibrated = False
         self.is_loaded  = True
         self._lock      = threading.Lock()
-        self._tflite_interp = None
+        # self._tflite_interp = None
         self._init_weights()
         self._init_adam()
 
@@ -194,23 +192,23 @@ class GRUAutoencoder:
 
     # ── TFLite file validation (weights stay numpy) ───────────────────────────
 
-    def load_from_bytes(self, tflite_bytes: bytes) -> bool:
-        path = os.path.join(MODEL_DIR, "current_model.tflite")
-        with open(path, "wb") as f:
-            f.write(tflite_bytes)
-        return self._validate_tflite(path)
+    # def load_from_bytes(self, tflite_bytes: bytes) -> bool:
+    #     path = os.path.join(MODEL_DIR, "current_model.tflite")
+    #     with open(path, "wb") as f:
+    #         f.write(tflite_bytes)
+    #     return self._validate_tflite(path)
 
-    def _validate_tflite(self, path: str) -> bool:
-        if not TFLITE_OK or not os.path.exists(path):
-            return True
-        try:
-            interp = tflite.Interpreter(model_path=path, num_threads=1)
-            interp.allocate_tensors()
-            self._tflite_interp = interp
-            print(f"[Model] TFLite file validated: {path}")
-        except Exception as e:
-            print(f"[Model] TFLite validation warning: {e} — numpy weights unaffected")
-        return True
+    # def _validate_tflite(self, path: str) -> bool:
+    #     if not TFLITE_OK or not os.path.exists(path):
+    #         return True
+    #     try:
+    #         interp = tflite.Interpreter(model_path=path, num_threads=1)
+    #         interp.allocate_tensors()
+    #         self._tflite_interp = interp
+    #         print(f"[Model] TFLite file validated: {path}")
+    #     except Exception as e:
+    #         print(f"[Model] TFLite validation warning: {e} — numpy weights unaffected")
+    #     return True
 
     # ── Encoder forward (GRU) ────────────────────────────────────────────────
 
@@ -403,17 +401,24 @@ class GRUAutoencoder:
          dWo, dbo)                               = self._dec_backward_tf(d_recon, dec_cache)
         dWr, dbr, dWz, dbz, dWn_x, dWn_h, dbn  = self._enc_backward(d_h_enc, enc_cache)
 
+        # Gradient clipping by global norm
+        grads = {
+            'Wr': dWr,      'br': dbr,
+            'Wz': dWz,      'bz': dbz,
+            'Wn_x': dWn_x,  'Wn_h': dWn_h,  'bn': dbn,
+            'Dec_Wr': dDec_Wr,   'Dec_br': dDec_br,
+            'Dec_Wz': dDec_Wz,   'Dec_bz': dDec_bz,
+            'Dec_Wn_x': dDec_Wn_x, 'Dec_Wn_h': dDec_Wn_h, 'Dec_bn': dDec_bn,
+            'Wo': dWo,      'bo': dbo,
+        }
+        global_norm = float(np.sqrt(sum(float(np.sum(g ** 2)) for g in grads.values())))
+        if global_norm > GRAD_CLIP_NORM:
+            scale = GRAD_CLIP_NORM / global_norm
+            grads = {k: v * scale for k, v in grads.items()}
+
         # Adam update
         with self._lock:
-            self._adam_step({
-                'Wr': dWr,      'br': dbr,
-                'Wz': dWz,      'bz': dbz,
-                'Wn_x': dWn_x,  'Wn_h': dWn_h,  'bn': dbn,
-                'Dec_Wr': dDec_Wr,   'Dec_br': dDec_br,
-                'Dec_Wz': dDec_Wz,   'Dec_bz': dDec_bz,
-                'Dec_Wn_x': dDec_Wn_x, 'Dec_Wn_h': dDec_Wn_h, 'Dec_bn': dDec_bn,
-                'Wo': dWo,      'bo': dbo,
-            })
+            self._adam_step(grads)
 
         return loss
 
@@ -446,12 +451,16 @@ class GRUAutoencoder:
 
     def calibrate_threshold(self, normal_errors: list):
         if len(normal_errors) > 20:
-            t = float(np.percentile(normal_errors, ANOMALY_PERCENTILE))
+            arr = np.array(normal_errors, dtype=np.float32)
+            p99 = float(np.percentile(arr, ANOMALY_PERCENTILE))
+            t   = p99 * ANOMALY_SAFETY_MULT
             with self._lock:
                 self.threshold  = t
                 self.calibrated = True
             print(f"[Model] Threshold calibrated: {t:.6f} "
-                  f"(n={len(normal_errors)}, p{ANOMALY_PERCENTILE})")
+                  f"(p{ANOMALY_PERCENTILE}={p99:.6f} × {ANOMALY_SAFETY_MULT} | "
+                  f"n={len(normal_errors)} | "
+                  f"min={arr.min():.6f} mean={arr.mean():.6f} max={arr.max():.6f})")
 
     # ── Checkpointing (atomic write) ─────────────────────────────────────────
 
@@ -484,12 +493,19 @@ class GRUAutoencoder:
                 if key in d:
                     setattr(self, key, d[key].astype(np.float32))
             if 'threshold' in d:
-                self.threshold  = float(d['threshold'][0])
-            if 'calibrated' in d:
-                self.calibrated = bool(d['calibrated'][0])
-        self._init_adam()   # stale moments are wrong after weight change
-        print(f"[Model] Restored from: {path} "
-              f"(calibrated={self.calibrated}, threshold={self.threshold:.6f})")
+                t = float(d['threshold'][0])
+                if 'calibrated' in d and bool(d['calibrated'][0]):
+                    if t > 1e-4:   # only restore if threshold is physically meaningful
+                        self.threshold  = t
+                        self.calibrated = True
+                    else:
+                        print(f"[Model] Checkpoint threshold={t:.6f} suspicious "
+                              f"— resetting to uncalibrated")
+                        self.threshold  = float('inf')
+                        self.calibrated = False
+                else:
+                    self.threshold  = float('inf')
+                    self.calibrated = False
 
     # ── FedAvg interface ─────────────────────────────────────────────────────
 
@@ -498,17 +514,36 @@ class GRUAutoencoder:
         with self._lock:
             return [getattr(self, k).copy() for k in self._WEIGHT_KEYS]
 
-    def set_weights_from_fedavg(self, flat_list: list):
-        if len(flat_list) != len(self._WEIGHT_KEYS):
-            print(f"[Model] FedAvg weight count mismatch "
-                  f"(expected {len(self._WEIGHT_KEYS)}, got {len(flat_list)})")
-            return
-        with self._lock:
-            for key, arr in zip(self._WEIGHT_KEYS, flat_list):
-                setattr(self, key, np.asarray(arr, dtype=np.float32))
-        self._init_adam()   # reset moments — averaged weights shift the loss landscape
-        print("[Model] FedAvg weights applied")
+   # REPLACE set_weights_from_fedavg (lines 514–523) with:
 
+def set_weights_from_fedavg(self, flat_list: list):
+    """Apply server-averaged GRU weights with full shape validation."""
+    if len(flat_list) != len(self._WEIGHT_KEYS):
+        print(f"[Model] FedAvg count mismatch: "
+              f"expected {len(self._WEIGHT_KEYS)}, got {len(flat_list)}")
+        return
+
+    # Validate every shape before touching any weight
+    F, H, XH = N_FEATURES, GRU_HIDDEN, N_FEATURES + GRU_HIDDEN
+    expected_shapes = {
+        'Wr': (XH,H), 'br': (H,), 'Wz': (XH,H), 'bz': (H,),
+        'Wn_x': (F,H), 'Wn_h': (H,H), 'bn': (H,),
+        'Dec_Wr': (XH,H), 'Dec_br': (H,), 'Dec_Wz': (XH,H), 'Dec_bz': (H,),
+        'Dec_Wn_x': (F,H), 'Dec_Wn_h': (H,H), 'Dec_bn': (H,),
+        'Wo': (H,F), 'bo': (F,),
+    }
+    for key, arr in zip(self._WEIGHT_KEYS, flat_list):
+        arr = np.asarray(arr, dtype=np.float32)
+        if arr.shape != expected_shapes[key]:
+            print(f"[Model] FedAvg shape mismatch on '{key}': "
+                  f"expected {expected_shapes[key]}, got {arr.shape} — aborted")
+            return
+
+    with self._lock:
+        for key, arr in zip(self._WEIGHT_KEYS, flat_list):
+            setattr(self, key, np.asarray(arr, dtype=np.float32))
+    self._init_adam()   # reset moments — averaged weights shift loss landscape
+    print(f"[Model] FedAvg weights applied ✓  ({len(flat_list)} arrays)")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SECTION 2: Rollback manager
@@ -755,6 +790,8 @@ class FederatedClient:
         self.current_loss  = float('inf')
         self.normal_errors = deque(maxlen=500)
         self.phase         = "local_pretraining"
+        self._recent_errors  = deque(maxlen=300)   # ~30s of scores at 10Hz
+        self._anomaly_tick   = 0                   # throttle ✓ prints to every 5s
 
         # ── Threading fix ────────────────────────────────────────────────────
         # A non-blocking lock ensures only ONE _training_cycle runs at a time.
@@ -837,24 +874,42 @@ class FederatedClient:
 
     # ── Apply global model ────────────────────────────────────────────────────
 
-    def _apply_global_model(self, data: dict):
-        """Apply FedAvg-averaged weights (and optionally validate tflite file)."""
-        round_num      = data.get("round", self.current_round + 1)
-        fedavg_weights = data.get("fedavg_weights")
-        tflite_bytes   = data.get("tflite_bytes")
+  # REPLACE the entire _apply_global_model method (lines 855–871) with:
 
-        if fedavg_weights is not None:
-            self.model.set_weights_from_fedavg(fedavg_weights)
+def _apply_global_model(self, data: dict):
+    """Apply FedAvg-averaged GRU weight arrays from server."""
+    round_num      = data.get("round", self.current_round + 1)
+    fedavg_weights = data.get("fedavg_weights")
+    server_keys    = data.get("weight_keys")   # new field from server
 
-        # Validate the tflite file with TFLite runtime if server sent one
-        if tflite_bytes is not None:
-            self.model.load_from_bytes(tflite_bytes)
+    if fedavg_weights is None:
+        print("[Client] Global model payload missing 'fedavg_weights' — ignored")
+        return
 
-        self.current_round = round_num
-        self.phase         = "local_pretraining"
-        self.trigger.store_reference(self.model.get_weights(), self.current_loss)
-        print(f"[Client] Global model applied ✓ (round {round_num})")
+    # Verify key order matches before applying — catches any future schema drift
+    if server_keys is not None:
+        expected = list(self.model._WEIGHT_KEYS)
+        if server_keys != expected:
+            print(f"[Client] Weight key mismatch from server!\n"
+                  f"  server : {server_keys}\n"
+                  f"  client : {expected}\n"
+                  f"  — global model NOT applied")
+            return
 
+    self.model.set_weights_from_fedavg(fedavg_weights)
+
+    # After receiving a global model the threshold may no longer
+    # reflect the new weight distribution — reset calibration so it
+    # recalibrates cleanly on the next training cycle
+    self.model.calibrated = False
+    self.normal_errors.clear()
+    print(f"[Client] Threshold reset — will recalibrate after next training cycle")
+
+    self.current_round = round_num
+    self.phase         = "federated_training"   # more accurate than local_pretraining
+    self.trigger.store_reference(self.model.get_weights(), self.current_loss)
+    print(f"[Client] Global model applied ✓  round={round_num}, "
+          f"weights={len(fedavg_weights)}")
     # ── Training cycle ────────────────────────────────────────────────────────
 
     def _training_cycle(self):
@@ -949,25 +1004,39 @@ class FederatedClient:
     def _detect_anomaly(self):
         """
         Runs every 100ms in the main loop.
-        Silent during pretraining (calibrated=False) — no false positives.
+        Silent (no alerts) during pretraining — calibrated=False gates MQTT publish.
+        Reconstruction scores are always collected and logged (throttled for normals).
         """
-        if not self.model.calibrated:
-            return
         window = self.collector.get_latest_window()
         if window is None:
             return
-        is_anomaly, score = self.model.infer(window)
+
+        # Always get raw score (bypasses calibration gate)
+        score = self.model.reconstruction_error(window)
+        self._recent_errors.append(score)
+        self._anomaly_tick += 1
+
+        if not self.model.calibrated:
+            return   # don't alert, but score was still collected above
+
+        thr        = self.model.threshold
+        is_anomaly = score > thr
+
         if is_anomaly:
-            print(f"[Client {self.client_id}] ⚠️  ANOMALY detected: "
-                  f"score={score:.6f} (threshold={self.model.threshold:.6f})")
+            print(f"[Anomaly] ⚠️  score={score:.6f}  threshold={thr:.6f}  "
+                  f"({score/thr*100:.0f}% of threshold)")
             if self.connected:
                 self.mqtt.publish("federated/alerts/attack", json.dumps({
                     "client_id": self.client_id,
                     "score":     score,
-                    "threshold": self.model.threshold,
+                    "threshold": thr,
                     "round":     self.current_round,
                     "timestamp": time.time(),
                 }))
+        elif self._anomaly_tick % 50 == 0:
+            # Log normal scores every ~5s so progress is visible without flooding
+            print(f"[Anomaly] ✓  score={score:.6f}  threshold={thr:.6f}  "
+                  f"({score/thr*100:.0f}% of threshold)")
 
     # ── Main loop ─────────────────────────────────────────────────────────────
 
@@ -977,8 +1046,8 @@ class FederatedClient:
         print(f"  Broker        : {self.broker}:{self.port}")
         print(f"  CAN interface : {self.collector.can_interface}")
         print(f"  Model         : GRU({GRU_HIDDEN}) autoencoder  [pure numpy]")
-        print(f"  TFLite        : {'available' if TFLITE_OK else 'not found'}"
-              f"  [used for file validation only]")
+        # print(f"  TFLite        : {'available' if TFLITE_OK else 'not found'}"
+        #       f"  [used for file validation only]")
         print(f"  Fed interval  : {FED_BASE_INTERVAL/3600:.0f}h base")
         print("=" * 60)
 
@@ -1013,13 +1082,28 @@ class FederatedClient:
                     _fps     = self.collector.frame_count / max(_elapsed, 1)
                     self.collector.frame_count      = 0
                     self.collector.last_count_reset = _now
+
+                    # Reconstruction error stats over the last ~30s
+                    if self._recent_errors:
+                        _errs       = np.array(self._recent_errors, dtype=np.float32)
+                        _thr        = self.model.threshold
+                        _n_above    = int(np.sum(_errs > _thr))
+                        _err_stats  = (f"recon: min={_errs.min():.4f} "
+                                       f"mean={_errs.mean():.4f} "
+                                       f"max={_errs.max():.4f} "
+                                       f"above_thr={_n_above}/{len(_errs)}")
+                    else:
+                        _err_stats = "recon: no data yet"
+
                     print(f"[Client {self.client_id}] "
                           f"phase={self.phase} | "
                           f"round={self.current_round} | "
                           f"loss={self.current_loss:.6f} | "
                           f"calibrated={self.model.calibrated} | "
+                          f"threshold={self.model.threshold:.4f} | "
+                          f"can_fps={_fps:.1f} | "
                           f"buffer={len(self.collector.buffer)} | "
-                          f"can_fps={_fps:.1f}")
+                          f"{_err_stats}")
 
                 time.sleep(0.1)
 
