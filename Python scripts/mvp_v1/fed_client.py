@@ -514,36 +514,36 @@ class GRUAutoencoder:
         with self._lock:
             return [getattr(self, k).copy() for k in self._WEIGHT_KEYS]
 
-   # REPLACE set_weights_from_fedavg (lines 514–523) with:
 
-def set_weights_from_fedavg(self, flat_list: list):
-    """Apply server-averaged GRU weights with full shape validation."""
-    if len(flat_list) != len(self._WEIGHT_KEYS):
-        print(f"[Model] FedAvg count mismatch: "
-              f"expected {len(self._WEIGHT_KEYS)}, got {len(flat_list)}")
-        return
+    def set_weights_from_fedavg(self, flat_list: list):
 
-    # Validate every shape before touching any weight
-    F, H, XH = N_FEATURES, GRU_HIDDEN, N_FEATURES + GRU_HIDDEN
-    expected_shapes = {
-        'Wr': (XH,H), 'br': (H,), 'Wz': (XH,H), 'bz': (H,),
-        'Wn_x': (F,H), 'Wn_h': (H,H), 'bn': (H,),
-        'Dec_Wr': (XH,H), 'Dec_br': (H,), 'Dec_Wz': (XH,H), 'Dec_bz': (H,),
-        'Dec_Wn_x': (F,H), 'Dec_Wn_h': (H,H), 'Dec_bn': (H,),
-        'Wo': (H,F), 'bo': (F,),
-    }
-    for key, arr in zip(self._WEIGHT_KEYS, flat_list):
-        arr = np.asarray(arr, dtype=np.float32)
-        if arr.shape != expected_shapes[key]:
-            print(f"[Model] FedAvg shape mismatch on '{key}': "
-                  f"expected {expected_shapes[key]}, got {arr.shape} — aborted")
+        """Apply server-averaged GRU weights with full shape validation."""
+        if len(flat_list) != len(self._WEIGHT_KEYS):
+            print(f"[Model] FedAvg count mismatch: "
+                f"expected {len(self._WEIGHT_KEYS)}, got {len(flat_list)}")
             return
 
-    with self._lock:
+        # Validate every shape before touching any weight
+        F, H, XH = N_FEATURES, GRU_HIDDEN, N_FEATURES + GRU_HIDDEN
+        expected_shapes = {
+            'Wr': (XH,H), 'br': (H,), 'Wz': (XH,H), 'bz': (H,),
+            'Wn_x': (F,H), 'Wn_h': (H,H), 'bn': (H,),
+            'Dec_Wr': (XH,H), 'Dec_br': (H,), 'Dec_Wz': (XH,H), 'Dec_bz': (H,),
+            'Dec_Wn_x': (F,H), 'Dec_Wn_h': (H,H), 'Dec_bn': (H,),
+            'Wo': (H,F), 'bo': (F,),
+        }
         for key, arr in zip(self._WEIGHT_KEYS, flat_list):
-            setattr(self, key, np.asarray(arr, dtype=np.float32))
-    self._init_adam()   # reset moments — averaged weights shift loss landscape
-    print(f"[Model] FedAvg weights applied ✓  ({len(flat_list)} arrays)")
+            arr = np.asarray(arr, dtype=np.float32)
+            if arr.shape != expected_shapes[key]:
+                print(f"[Model] FedAvg shape mismatch on '{key}': "
+                    f"expected {expected_shapes[key]}, got {arr.shape} — aborted")
+                return
+
+        with self._lock:
+            for key, arr in zip(self._WEIGHT_KEYS, flat_list):
+                setattr(self, key, np.asarray(arr, dtype=np.float32))
+        self._init_adam()   # reset moments — averaged weights shift loss landscape
+        print(f"[Model] FedAvg weights applied ✓  ({len(flat_list)} arrays)")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SECTION 2: Rollback manager
@@ -876,40 +876,40 @@ class FederatedClient:
 
   # REPLACE the entire _apply_global_model method (lines 855–871) with:
 
-def _apply_global_model(self, data: dict):
-    """Apply FedAvg-averaged GRU weight arrays from server."""
-    round_num      = data.get("round", self.current_round + 1)
-    fedavg_weights = data.get("fedavg_weights")
-    server_keys    = data.get("weight_keys")   # new field from server
+    def _apply_global_model(self, data: dict):
+        """Apply FedAvg-averaged GRU weight arrays from server."""
+        round_num      = data.get("round", self.current_round + 1)
+        fedavg_weights = data.get("fedavg_weights")
+        server_keys    = data.get("weight_keys")   # new field from server
 
-    if fedavg_weights is None:
-        print("[Client] Global model payload missing 'fedavg_weights' — ignored")
-        return
-
-    # Verify key order matches before applying — catches any future schema drift
-    if server_keys is not None:
-        expected = list(self.model._WEIGHT_KEYS)
-        if server_keys != expected:
-            print(f"[Client] Weight key mismatch from server!\n"
-                  f"  server : {server_keys}\n"
-                  f"  client : {expected}\n"
-                  f"  — global model NOT applied")
+        if fedavg_weights is None:
+            print("[Client] Global model payload missing 'fedavg_weights' — ignored")
             return
 
-    self.model.set_weights_from_fedavg(fedavg_weights)
+        # Verify key order matches before applying — catches any future schema drift
+        if server_keys is not None:
+            expected = list(self.model._WEIGHT_KEYS)
+            if server_keys != expected:
+                print(f"[Client] Weight key mismatch from server!\n"
+                    f"  server : {server_keys}\n"
+                    f"  client : {expected}\n"
+                    f"  — global model NOT applied")
+                return
 
-    # After receiving a global model the threshold may no longer
-    # reflect the new weight distribution — reset calibration so it
-    # recalibrates cleanly on the next training cycle
-    self.model.calibrated = False
-    self.normal_errors.clear()
-    print(f"[Client] Threshold reset — will recalibrate after next training cycle")
+        self.model.set_weights_from_fedavg(fedavg_weights)
 
-    self.current_round = round_num
-    self.phase         = "federated_training"   # more accurate than local_pretraining
-    self.trigger.store_reference(self.model.get_weights(), self.current_loss)
-    print(f"[Client] Global model applied ✓  round={round_num}, "
-          f"weights={len(fedavg_weights)}")
+        # After receiving a global model the threshold may no longer
+        # reflect the new weight distribution — reset calibration so it
+        # recalibrates cleanly on the next training cycle
+        self.model.calibrated = False
+        self.normal_errors.clear()
+        print(f"[Client] Threshold reset — will recalibrate after next training cycle")
+
+        self.current_round = round_num
+        self.phase         = "federated_training"   # more accurate than local_pretraining
+        self.trigger.store_reference(self.model.get_weights(), self.current_loss)
+        print(f"[Client] Global model applied ✓  round={round_num}, "
+            f"weights={len(fedavg_weights)}")
     # ── Training cycle ────────────────────────────────────────────────────────
 
     def _training_cycle(self):
