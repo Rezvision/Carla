@@ -79,6 +79,7 @@ ROLLBACK_PATIENCE    = 3         # consecutive worsening rounds before rollback
 FED_BASE_INTERVAL    = 21600     # 6 hours base federation interval
 FED_MIN_INTERVAL     = 1800      # 30 min minimum between federation rounds
 DIVERGENCE_THRESHOLD = 0.10      # weight-drift trigger for early federation
+NOISE_STD = 0.05
 _BASE_DIR      = os.path.dirname(os.path.abspath(__file__))
 MODEL_DIR      = os.path.join(_BASE_DIR, "models")
 CHECKPOINT_DIR = "/tmp/fed_ids_checkpoints"
@@ -386,8 +387,13 @@ class GRUAutoencoder:
         x_flat = x_batch.astype(np.float32)
         x_seq  = x_flat.reshape(-1, WINDOW_SIZE, N_FEATURES)
 
+        # add noise to encoder input only — target stays clean
+        noise  = np.random.normal(0, NOISE_STD,
+                                x_seq.shape).astype(np.float32)
+        x_noisy = x_seq + noise
+
         # Forward — teacher forcing during training
-        h_enc, enc_cache = self._enc_forward(x_seq)
+        h_enc, enc_cache = self._enc_forward(x_noisy)
         recon, dec_cache = self._dec_forward_train(h_enc, x_seq)   # (batch, T, F)
 
         diff = recon - x_seq
@@ -739,7 +745,7 @@ class DataCollector:
     def ready(self) -> bool:
         return len(self.buffer) >= MIN_BUFFER_FRAMES
 
-    def get_windows(self, stride: int = 5,
+    def get_windows(self, stride: int = 20,
                     max_windows: int = 400) -> np.ndarray:
         """Return (N, 160) normalised sliding-window array for training."""
         if not self.ready():
@@ -934,7 +940,7 @@ class FederatedClient:
             return
 
         self._publish_status("training")
-        windows = self.collector.get_windows(stride=5)
+        windows = self.collector.get_windows(stride=20)
         if windows is None:
             self._publish_status("idle")
             return
@@ -1023,7 +1029,7 @@ class FederatedClient:
         is_anomaly = score > thr
 
         if is_anomaly:
-            print(f"[Anomaly] ⚠️  score={score:.6f}  threshold={thr:.6f}  "
+            print(f"Anomaly Detected, score={score:.6f}  threshold={thr:.6f}  "
                   f"({score/thr*100:.0f}% of threshold)")
             if self.connected:
                 self.mqtt.publish("federated/alerts/attack", json.dumps({
@@ -1035,7 +1041,7 @@ class FederatedClient:
                 }))
         elif self._anomaly_tick % 50 == 0:
             # Log normal scores every ~5s so progress is visible without flooding
-            print(f"[Anomaly] ✓  score={score:.6f}  threshold={thr:.6f}  "
+            print(f"Healthy system,  score={score:.6f}  threshold={thr:.6f}  "
                   f"({score/thr*100:.0f}% of threshold)")
 
     # ── Main loop ─────────────────────────────────────────────────────────────
