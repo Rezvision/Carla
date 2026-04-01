@@ -498,21 +498,46 @@ class GRUAutoencoder:
             for key in self._WEIGHT_KEYS:
                 if key in d:
                     setattr(self, key, d[key].astype(np.float32))
+
+            # ── Weight sanity guard ───────────────────────────────────────────
+            # A collapsed or degenerate model has near-zero weight norms.
+            # Compute the mean L2 norm across all weight matrices — a healthy
+            # freshly-initialised model has norms in the range 0.5 – 5.0.
+            # Near-zero means the checkpoint was saved after overfitting collapse
+            # or after a bad FedAvg round averaged near-zero weights.
+            sample_norm = float(np.mean([
+                float(np.linalg.norm(getattr(self, k)))
+                for k in self._WEIGHT_KEYS
+            ]))
+            if sample_norm < 0.01:
+                print(f"[Model] Checkpoint weights degenerate "
+                    f"(mean_norm={sample_norm:.6f}) — reinitialising fresh")
+                self._init_weights()
+                self._init_adam()
+                self.threshold  = float('inf')
+                self.calibrated = False
+                return
+
+            # ── Threshold sanity guard (existing) ────────────────────────────
             if 'threshold' in d:
                 t = float(d['threshold'][0])
                 if 'calibrated' in d and bool(d['calibrated'][0]):
-                    if t > 1e-4:   # only restore if threshold is physically meaningful
+                    if t > 1e-4:
                         self.threshold  = t
                         self.calibrated = True
                     else:
                         print(f"[Model] Checkpoint threshold={t:.6f} suspicious "
-                              f"— resetting to uncalibrated")
+                            f"— resetting to uncalibrated")
                         self.threshold  = float('inf')
                         self.calibrated = False
                 else:
                     self.threshold  = float('inf')
                     self.calibrated = False
 
+        self._init_adam()
+        print(f"[Model] Restored from: {path} "
+            f"(mean_norm={sample_norm:.4f}, "
+            f"calibrated={self.calibrated}, threshold={self.threshold:.6f})")
     # ── FedAvg interface ─────────────────────────────────────────────────────
 
     def get_weights(self) -> list:
