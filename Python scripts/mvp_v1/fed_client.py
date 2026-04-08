@@ -715,7 +715,11 @@ class DataCollector:
             base_offset + 0x28: 'gear',
         }
         print(f"[DataCollector] CAN ID map (edge {edge_num}): "
-              f"{', '.join(f'0x{k:03X}→{v}' for k, v in self.can_id_map.items())}") 
+              f"{', '.join(f'0x{k:03X}→{v}' for k, v in self.can_id_map.items())}")
+
+        # Counters for filtered / ignored frames (logged periodically in status)
+        self._err_frame_count = 0
+        self._unmapped_counts = {}   # {arb_id: count}
 
     def start(self):
         self.running = True
@@ -731,8 +735,14 @@ class DataCollector:
             bus = can.Bus(channel=self.can_interface, interface='socketcan')
             while self.running:
                 msg = bus.recv(timeout=1.0)
-                if msg:
-                    self._process(msg)
+                if msg is None:
+                    continue
+                # Skip CAN error frames (MCP2515 reports these with low
+                # arbitration IDs like 0x004) and remote request frames
+                if msg.is_error_frame or msg.is_remote_frame:
+                    self._err_frame_count += 1
+                    continue
+                self._process(msg)
         except Exception as e:
             print(f"[DataCollector] CAN error: {e} — using simulated data")
             self._simulate()
@@ -745,7 +755,8 @@ class DataCollector:
                 self.state[self.can_id_map[cid]] = v
                 self._push()
             else:
-                print(f"[DataCollector] Unmapped CAN ID: 0x{cid:03X}")
+                # Shared bus — other vehicles' IDs are expected, don't flood log
+                self._unmapped_counts[cid] = self._unmapped_counts.get(cid, 0) + 1
         except Exception:
             pass
 
@@ -1162,6 +1173,19 @@ class FederatedClient:
                           f"can_fps={_fps:.1f} | "
                           f"buffer={len(self.collector.buffer)} | "
                           f"{_err_stats}")
+
+                    # CAN bus health: error frames + other-vehicle traffic
+                    _uc = self.collector._unmapped_counts
+                    _ec = self.collector._err_frame_count
+                    if _uc or _ec:
+                        _top = ', '.join(f'0x{k:03X}:{v}'
+                                         for k, v in sorted(_uc.items(),
+                                                            key=lambda x: -x[1])[:5])
+                        print(f"[CAN bus] err_frames={_ec} | "
+                              f"unmapped={sum(_uc.values())} "
+                              f"[{_top}]")
+                        self.collector._unmapped_counts = {}
+                        self.collector._err_frame_count = 0
 
                 time.sleep(0.1)
 
