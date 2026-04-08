@@ -690,7 +690,8 @@ class DataCollector:
         'steering',  'gear',          'location_x', 'location_y',
     ]
 
-    def __init__(self, can_interface: str = 'can0', buffer_size: int = 2000):
+    def __init__(self, can_interface: str = 'can0', buffer_size: int = 2000,
+                 edge_num: int = 1):
         self.can_interface = can_interface
         self.buffer        = deque(maxlen=buffer_size)
         self.state         = {n: 0.0 for n in self.FEATURE_NAMES}
@@ -700,6 +701,21 @@ class DataCollector:
         self.mean          = np.zeros(N_FEATURES, dtype=np.float32)
         self.std           = np.ones(N_FEATURES,  dtype=np.float32)
         self.scaler_fitted = False
+
+        # ── Per-vehicle CAN ID mapping ───────────────────────────────────
+        # edge_1 → 0x123–0x128,  edge_2 → 0x223–0x228,  etc.
+        # The hundreds digit encodes the vehicle/edge number.
+        base_offset = edge_num * 0x100
+        self.can_id_map = {
+            base_offset + 0x23: 'speed_kmh',
+            base_offset + 0x24: 'battery_level',
+            base_offset + 0x25: 'throttle',
+            base_offset + 0x26: 'brake',
+            base_offset + 0x27: 'steering',
+            base_offset + 0x28: 'gear',
+        }
+        print(f"[DataCollector] CAN ID map (edge {edge_num}): "
+              f"{', '.join(f'0x{k:03X}→{v}' for k, v in self.can_id_map.items())}") 
 
     def start(self):
         self.running = True
@@ -725,11 +741,8 @@ class DataCollector:
         cid = msg.arbitration_id
         try:
             v = struct.unpack('<f', msg.data[:4])[0]
-            m = {0x123: 'speed_kmh',  0x124: 'battery_level',
-                 0x125: 'throttle',   0x126: 'brake',
-                 0x127: 'steering',   0x128: 'gear'}
-            if cid in m:
-                self.state[m[cid]] = v
+            if cid in self.can_id_map:
+                self.state[self.can_id_map[cid]] = v
             self._push()
         except Exception:
             pass
@@ -809,7 +822,17 @@ class FederatedClient:
         self.port      = port
 
         self.model     = GRUAutoencoder()
-        self.collector = DataCollector(can_interface)
+
+        # Extract edge number from client_id (e.g. "edge_2" → 2)
+        # Defaults to 1 if the id doesn't end with a digit.
+        try:
+            self._edge_num = int(client_id.split('_')[-1])
+        except (ValueError, IndexError):
+            self._edge_num = 1
+            print(f"[Client] Could not parse edge number from '{client_id}' "
+                  f"— defaulting to {self._edge_num}")
+
+        self.collector = DataCollector(can_interface, edge_num=self._edge_num)
         self.rollback  = RollbackManager(self.model)
         self.trigger   = FederationTrigger()
 
@@ -1076,6 +1099,8 @@ class FederatedClient:
         print(f"FEDERATED IDS CLIENT — {self.client_id}")
         print(f"  Broker        : {self.broker}:{self.port}")
         print(f"  CAN interface : {self.collector.can_interface}")
+        _ids = ', '.join(f'0x{k:03X}' for k in self.collector.can_id_map)
+        print(f"  CAN IDs       : {_ids}  (edge {self._edge_num})")
         print(f"  Model         : GRU({GRU_HIDDEN}) autoencoder  [pure numpy]")
         # print(f"  TFLite        : {'available' if TFLITE_OK else 'not found'}"
         #       f"  [used for file validation only]")
