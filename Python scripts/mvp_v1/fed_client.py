@@ -754,7 +754,7 @@ class DataCollector:
         while self.running:
             s = self.state
             s['speed_kmh']     = max(0, s.get('speed_kmh',     50) + random.gauss(0, 2))
-            s['battery_level'] = max(0, min(100, s.get('battery_level', 80) - 0.01))
+            s['battery_level'] = max(0, min(100, s.get('battery_level', 80) - 0.0003))#rounded to 0.0003 from 0.000298
             s['throttle']      = max(0, min(1, 0.3 + random.gauss(0, 0.1)))
             s['brake']         = max(0, min(1, abs(random.gauss(0, 0.05))))
             s['steering']      = random.gauss(0, 0.1)
