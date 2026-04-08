@@ -743,7 +743,9 @@ class DataCollector:
             v = struct.unpack('<f', msg.data[:4])[0]
             if cid in self.can_id_map:
                 self.state[self.can_id_map[cid]] = v
-            self._push()
+                self._push()
+            else:
+                print(f"[DataCollector] Unmapped CAN ID: 0x{cid:03X}")
         except Exception:
             pass
 
