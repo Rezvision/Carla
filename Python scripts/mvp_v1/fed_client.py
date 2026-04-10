@@ -1092,6 +1092,16 @@ class FederatedClient:
         if is_anomaly:
             print(f"Anomaly Detected, score={score:.6f}  threshold={thr:.6f}  "
                   f"({score/thr*100:.0f}% of threshold)")
+            norm_win = window.reshape(WINDOW_SIZE, N_FEATURES)
+            raw_win  = norm_win * self.collector.std + self.collector.mean
+            abbrev   = ['speed', 'batt%', 'throt', 'brake', 'steer', 'gear', 'loc_x', 'loc_y']
+            col_hdr  = "   ".join(f"{a:>7}" for a in abbrev)
+            print(f"  [Anomaly window — {WINDOW_SIZE} frames]")
+            print(f"   t   {col_hdr}   (normalised → raw)")
+            for i in range(WINDOW_SIZE):
+                norm_str = "   ".join(f"{v:>7.3f}" for v in norm_win[i])
+                raw_str  = "   ".join(f"{v:>7.2f}" for v in raw_win[i])
+                print(f"  {i+1:>2}   {norm_str}   |   {raw_str}")
             if self.connected:
                 self.mqtt.publish("federated/alerts/attack", json.dumps({
                     "client_id": self.client_id,
