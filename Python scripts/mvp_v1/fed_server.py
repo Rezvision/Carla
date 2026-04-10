@@ -44,6 +44,7 @@ Requirements (Windows server):
 """
 
 import os
+import sys
 import json
 import time
 import pickle
@@ -52,6 +53,49 @@ import numpy as np
 from datetime import datetime
 from collections import defaultdict
 import paho.mqtt.client as mqtt
+
+# ── LOGGING SETUP ─────────────────────────────────────────────────────────────
+LOGS_DIR = "./logs"
+
+class _TeeOutput:
+    """Writes every print() to both the original stdout and a log file."""
+
+    def __init__(self, log_path: str, original_stdout):
+        self._stdout = original_stdout
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        self._file = open(log_path, "a", encoding="utf-8", buffering=1)
+
+    def write(self, data):
+        self._stdout.write(data)
+        self._file.write(data)
+
+    def flush(self):
+        self._stdout.flush()
+        self._file.flush()
+
+    def close(self):
+        self._file.flush()
+        self._file.close()
+
+    # Forward any other attribute lookups to the real stdout
+    def __getattr__(self, name):
+        return getattr(self._stdout, name)
+
+
+def _setup_logging() -> str:
+    """
+    Redirect stdout (and stderr) to a Tee that also writes to
+    logs/fed_server_YYYYMMDD_HHMMSS.txt.  Returns the log file path.
+    """
+    ts       = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_path = os.path.join(LOGS_DIR, f"fed_server_{ts}.txt")
+
+    tee = _TeeOutput(log_path, sys.stdout)
+    sys.stdout = tee
+    sys.stderr = tee          # also capture tracebacks / warnings
+
+    return log_path
+# ─────────────────────────────────────────────────────────────────────────────
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 MQTT_BROKER    = "localhost"
@@ -617,6 +661,9 @@ def main():
     p.add_argument("--port",        type=int, default=MQTT_PORT)
     p.add_argument("--min-clients", type=int, default=MIN_CLIENTS)
     args = p.parse_args()
+
+    log_path = _setup_logging()
+    print(f"[Logger] Logging to: {log_path}\n")
 
     FederatedServer(
         broker=args.broker,
