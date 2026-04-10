@@ -37,6 +37,7 @@ Requirements (Raspberry Pi):
 """
 
 import os
+import sys
 # os.environ["TFLITE_DISABLE_XNNPACK"] = "1"   # before tflite import
 import json
 import time
@@ -80,13 +81,48 @@ FED_BASE_INTERVAL    = 21600     # 6 hours base federation interval
 FED_MIN_INTERVAL     = 1800      # 30 min minimum between federation rounds
 DIVERGENCE_THRESHOLD = 0.10      # weight-drift trigger for early federation
 NOISE_STD = 0.05
+LOGS_DIR  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
 _BASE_DIR      = os.path.dirname(os.path.abspath(__file__))
 MODEL_DIR      = os.path.join(_BASE_DIR, "models")
 CHECKPOINT_DIR = "/tmp/fed_ids_checkpoints"
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 os.makedirs(MODEL_DIR, exist_ok=True)
+os.makedirs(LOGS_DIR, exist_ok=True)
 # ─────────────────────────────────────────────────────────────────────────────
 
+# ── LOGGING SETUP ─────────────────────────────────────────────────────────────
+
+class _TeeOutput:
+    """Writes every print() to both the original stdout and a log file."""
+
+    def __init__(self, log_path: str, original_stdout):
+        self._stdout = original_stdout
+        self._file   = open(log_path, "a", encoding="utf-8", buffering=1)
+
+    def write(self, data):
+        self._stdout.write(data)
+        self._file.write(data)
+
+    def flush(self):
+        self._stdout.flush()
+        self._file.flush()
+
+    def close(self):
+        self._file.flush()
+        self._file.close()
+
+    def __getattr__(self, name):
+        return getattr(self._stdout, name)
+
+
+def _setup_logging(client_id: str) -> str:
+    from datetime import datetime
+    ts       = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_path = os.path.join(LOGS_DIR, f"fed_client_{client_id}_{ts}.txt")
+    tee      = _TeeOutput(log_path, sys.stdout)
+    sys.stdout = tee
+    sys.stderr = tee
+    return log_path
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SECTION 1: GRU Autoencoder  (pure numpy, thread-safe)
@@ -1221,6 +1257,9 @@ def main():
     p.add_argument("--port",          type=int, default=1883)
     p.add_argument("--can-interface", default="can0")
     args = p.parse_args()
+
+    log_path = _setup_logging(args.client_id)
+    print(f"[Logger] Logging to: {log_path}\n")
 
     FederatedClient(
         client_id=args.client_id,
