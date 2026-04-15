@@ -38,6 +38,7 @@ Requirements (Raspberry Pi):
 
 import os
 import sys
+import pathlib
 # os.environ["TFLITE_DISABLE_XNNPACK"] = "1"   # before tflite import
 import json
 import time
@@ -84,10 +85,10 @@ NOISE_STD = 0.05
 LOGS_DIR  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
 _BASE_DIR      = os.path.dirname(os.path.abspath(__file__))
 MODEL_DIR      = os.path.join(_BASE_DIR, "models")
-CHECKPOINT_DIR = "/tmp/fed_ids_checkpoints"
-os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-os.makedirs(MODEL_DIR, exist_ok=True)
-os.makedirs(LOGS_DIR, exist_ok=True)
+CHECKPOINT_DIR = os.path.join(_BASE_DIR, "checkpoints")
+pathlib.Path(CHECKPOINT_DIR).mkdir(parents=True, exist_ok=True)
+pathlib.Path(MODEL_DIR).mkdir(parents=True, exist_ok=True)
+pathlib.Path(LOGS_DIR).mkdir(parents=True, exist_ok=True)
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── LOGGING SETUP ─────────────────────────────────────────────────────────────
