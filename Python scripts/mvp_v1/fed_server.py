@@ -438,7 +438,10 @@ class FederatedServer:
                 client_id, weights, num_samples, loss, round_num)
 
             if not accepted:
+                print(f"[Server] Update from {client_id} rejected — failed validation")
                 return
+
+            self.known_clients.add(client_id)
 
             n = self.aggregator.n_updates()
             print(f"[Server] Updates collected: {n}/{self.min_clients}")
@@ -647,11 +650,17 @@ class FederatedServer:
             print("\nShutting down server...")
         finally:
             if self.mqtt_client:
-                self.mqtt_client.loop_stop()
-                try:
-                    self.mqtt_client.disconnect()
-                except Exception:
-                    pass
+                def _mqtt_shutdown():
+                    try:
+                        self.mqtt_client.disconnect()
+                    except Exception:
+                        pass
+                    self.mqtt_client.loop_stop()
+                t = threading.Thread(target=_mqtt_shutdown, daemon=True)
+                t.start()
+                t.join(timeout=3.0)
+                if t.is_alive():
+                    print("[Server] MQTT shutdown timed out — forcing exit")
 
 
 def main():
