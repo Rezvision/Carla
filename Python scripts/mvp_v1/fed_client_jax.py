@@ -49,8 +49,8 @@ NOISE_STD            = 0.05        # denoising autoencoder — prevents memorisa
 L2_LAMBDA            = 1e-4        # weight regularisation
 MIN_DELTA            = 0.0005      # early stopping threshold per epoch
 ROLLBACK_PATIENCE    = 3
-FED_BASE_INTERVAL    = 21600
-FED_MIN_INTERVAL     = 1800
+FED_BASE_INTERVAL    = 3600   # 60 min — matches server late phase
+FED_MIN_INTERVAL     = 900    # 15 min — matches server early phase
 DIVERGENCE_THRESHOLD = 0.10
 _BASE_DIR      = os.path.dirname(os.path.abspath(__file__))
 CHECKPOINT_DIR = "/tmp/fed_ids_checkpoints"
@@ -757,6 +757,7 @@ class FederatedClient:
         self.phase              = "local_pretraining"
         self._recent_errors     = deque(maxlen=300)
         self._anomaly_tick      = 0
+        self._server_requested  = False
         self._train_lock        = threading.Lock()
         self._last_train_time   = time.time()
         self._last_applied_round = -1   # dedup retained MQTT messages
@@ -812,6 +813,7 @@ class FederatedClient:
                 self.model_queue.put(pickle.loads(message.payload))
             elif message.topic == "federated/aggregation/trigger":
                 print(f"[Client {self.client_id}] Server requested training round")
+                self._server_requested = True
                 threading.Thread(target=self._training_cycle,
                                  daemon=True).start()
         except Exception as e:
@@ -926,13 +928,21 @@ class FederatedClient:
 
         # ── Federation trigger ────────────────────────────────────────────
         current_weights = self.model.get_weights()
-        should_fed, reason = self.trigger.should_federate(
-            current_weights, avg_loss)
-        if should_fed and self.rollback.is_improving():
+        server_req = self._server_requested
+        self._server_requested = False   # consume before any early return
+
+        if server_req:
+            print(f"[Client {self.client_id}] Server-requested send — bypassing trigger")
             self._send_weight_update(current_weights, avg_loss, len(windows))
             self.trigger.store_reference(current_weights, avg_loss)
         else:
-            print(f"[Client] Federation: {reason}")
+            should_fed, reason = self.trigger.should_federate(
+                current_weights, avg_loss)
+            if should_fed and self.rollback.is_improving():
+                self._send_weight_update(current_weights, avg_loss, len(windows))
+                self.trigger.store_reference(current_weights, avg_loss)
+            else:
+                print(f"[Client] Federation: {reason}")
 
         # ── Threshold calibration ─────────────────────────────────────────
         for w in windows[:100]:
