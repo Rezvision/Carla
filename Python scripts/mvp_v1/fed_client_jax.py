@@ -589,6 +589,10 @@ class FederationTrigger:
         loss_change = (abs(current_loss - self.ref_loss) / max(self.ref_loss, 1e-8)
                        if self.ref_loss is not None else float('inf'))
 
+        # First-ever federation: no reference weights yet, send immediately
+        if self.ref_weights is None:
+            return True, "initial_federation"
+
         if divergence > DIVERGENCE_THRESHOLD and elapsed > FED_MIN_INTERVAL:
             return True, f"weight_divergence={divergence:.4f}"
         if loss_change > 0.30 and elapsed > FED_MIN_INTERVAL:
