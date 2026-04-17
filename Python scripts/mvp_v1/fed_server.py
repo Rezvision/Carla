@@ -109,9 +109,12 @@ MIN_CLIENTS    = 2           # minimum updates before triggering FedAvg
 #   Late phase   : aggregate every 60 min → reduced overhead once stable
 # Transition occurs when avg loss improvement between consecutive rounds
 # falls below LOSS_IMPROVEMENT_THRESHOLD (i.e. model has largely converged).
+# MIN_EARLY_ROUNDS prevents a premature switch driven by noisy early rounds
+# or by client-count variance (e.g. only 1 client contributed one round).
 EARLY_INTERVAL_SEC         = 900     # 15 minutes
 LATE_INTERVAL_SEC          = 3600    # 60 minutes
 LOSS_IMPROVEMENT_THRESHOLD = 0.05    # 5% relative improvement triggers switch
+MIN_EARLY_ROUNDS           = 5       # must complete this many rounds before early→late
 
 CHECKPOINT_DIR = "./models/checkpoints"
 
@@ -396,12 +399,18 @@ class FederatedServer:
             client.subscribe("federated/clients/status")
 
             # Re-broadcast the last global model to any clients that
-            # connected while the server was offline
+            # connected while the server was offline.
+            # Done in a thread so _on_connect returns immediately and
+            # the SUBSCRIBE packets above are sent to the broker before
+            # wait_for_publish() in _broadcast_global_model can block.
             if self.checkpointer.last_averaged is not None:
                 print("[Server] Re-broadcasting last global model "
                       "to reconnected clients...")
-                self._broadcast_global_model(
-                    self.checkpointer.last_averaged)
+                threading.Thread(
+                    target=self._broadcast_global_model,
+                    args=(self.checkpointer.last_averaged,),
+                    daemon=True,
+                ).start()
         else:
             print(f"Server MQTT connection failed: rc={rc}")
 
@@ -487,7 +496,7 @@ class FederatedServer:
             # Track loss and switch from early→late when improvement stalls
             self.loss_history.append(avg_loss)
             if (self.phase == "early"
-                    and len(self.loss_history) >= 2
+                    and len(self.loss_history) >= MIN_EARLY_ROUNDS
                     and self.loss_history[-2] > 0):
                 prev_loss = self.loss_history[-2]
                 improvement = (prev_loss - avg_loss) / prev_loss
@@ -496,7 +505,7 @@ class FederatedServer:
                       f"Prev: {prev_loss:.6f} | "
                       f"Improvement: {improvement:.2%}")
 
-                if improvement < LOSS_IMPROVEMENT_THRESHOLD:
+                if 0 < improvement < LOSS_IMPROVEMENT_THRESHOLD:
                     self.phase = "late"
                     self.round_interval = LATE_INTERVAL_SEC
                     print(f"[Scheduler] *** PHASE SWITCH: early → late ***")
@@ -567,8 +576,9 @@ class FederatedServer:
             elapsed = time.time() - self.round_start
             n       = self.aggregator.n_updates()
 
-            if (elapsed >= self.round_interval and n >= 1
+            if (elapsed >= self.round_interval and n >= self.min_clients
                     and not self._round_in_progress):
+                self.mqtt_client.publish("federated/aggregation/trigger", json.dumps({"round":self.current_round + 1}))
                 print(f"\n[Scheduler] {self.phase.upper()} phase — "
                       f"triggering round after {elapsed/60:.0f} min "
                       f"with {n} update(s)")
