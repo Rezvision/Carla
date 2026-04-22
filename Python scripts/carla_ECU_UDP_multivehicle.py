@@ -22,6 +22,9 @@ except ImportError:
 # --- Configuration ---
 UDP_TARGET = "192.168.0.125"
 
+PI_IPS = ["192.168.0.111", "192.168.0.211", "192.168.0.99"]  # edge_1, edge_2, edge_3
+
+
 VEHICLE_SIGNAL_PORTS = [
     {"CAN_speed": 5100, "CAN_battery": 5101, "CAN_throttle": 5102, 
      "CAN_brake": 5103, "CAN_steering": 5104, "CAN_gear": 5105},
@@ -131,8 +134,8 @@ def get_data(vehicle, battery):
     vel = vehicle.get_velocity()
     ctrl = vehicle.get_control()
     loc = vehicle.get_location()
-    speed = 3.6 * ((vel.x**2 + vel.y**2)**0.5)
-    battery = max(0, battery - ctrl.throttle * 0.1)
+    speed = 3.6 * ((vel.x**2 + vel.y**2)**0.5) 
+    battery = max(0, battery - ctrl.throttle * 0.000298)
     
     return {
         'speed_kmh': round(speed, 2),
@@ -163,7 +166,7 @@ def send_udp(sockets, data, idx):
 
 def send_location(sock, data, idx):
     loc = f"{data['location_x']},{data['location_y']},{data['location_z']}"
-    sock.sendto(loc.encode(), (UDP_TARGET, LOCATION_PORTS[idx]))
+    sock.sendto(loc.encode(), (PI_IPS[idx], LOCATION_PORTS[idx]))
 
 
 def cleanup(vehicles, sockets, loc_sockets, loggers):
