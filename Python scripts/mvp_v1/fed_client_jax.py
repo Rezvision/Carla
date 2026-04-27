@@ -644,36 +644,69 @@ class DataCollector:
             base_offset + 0x27: 'steering',
             base_offset + 0x28: 'gear',
         }
+        self.location_port = 9875 + edge_num   # edge_1→9876, edge_2→9877, edge_3→9878
+        print(f"[DataCollector] Location UDP port: {self.location_port}")
         print(f"[DataCollector] CAN ID map (edge {edge_num}): "
               f"{', '.join(f'0x{k:03X}→{v}' for k, v in self.can_id_map.items())}")
 
     def start(self):
         self.running = True
         threading.Thread(target=self._can_listener, daemon=True).start()
-        print(f"[DataCollector] Started on {self.can_interface}")
+        threading.Thread(target=self._location_listener, daemon=True).start()
+        print(f"[DataCollector] Started on {self.can_interface}"
+              f"(+ UDP location :{self.location_port})")
 
     def stop(self):
         self.running = False
 
     def _can_listener(self):
-        bus = None
-        try:
-            import can
-            bus = can.Bus(channel=self.can_interface, interface='socketcan')
-            while self.running:
-                msg = bus.recv(timeout=1.0)
-                if msg:
-                    self._process(msg)
-        except Exception as e:
-            print(f"[DataCollector] CAN error: {e} — using simulated data")
-            self._simulate()
-        finally:
-            if bus is not None:
-                try:
-                    bus.shutdown()
-                except Exception:
-                    pass
+        import can
+        while self.running:
+            bus = None
+            try:
+                
+                bus = can.Bus(channel=self.can_interface, interface='socketcan')
+                while self.running:
+                    msg = bus.recv(timeout=1.0)
+                    if msg:
+                        self._process(msg)
+            except Exception as e:
+                print(f"[DataCollector] CAN error: {e} — retrying in 5s")
+                # self._simulate()
+            finally:
+                if bus is not None:
+                    try:
+                        bus.shutdown()
+                    except Exception:
+                        pass
 
+    def _location_listener(self):
+        
+        """Receive 'x,y,z' UDP strings from CARLA and update shared state."""
+        import socket
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.bind(('0.0.0.0', self.location_port))
+            sock.settimeout(1.0)
+            print(f"[DataCollector] Location listener bound to :{self.location_port}")
+            while self.running:
+                try:
+                    data, _ = sock.recvfrom(256)
+                    parts = data.decode('utf-8', errors='ignore').split(',')
+                    if len(parts) >= 2:
+                        # Atomic dict writes at CPython level — no lock needed
+                        # for single-field updates of a primitive value.
+                        self.state['location_x'] = float(parts[0])
+                        self.state['location_y'] = float(parts[1])
+                        # location_z dropped — not in FEATURE_NAMES
+                except socket.timeout:
+                    continue
+                except Exception as e:
+                    print(f"[DataCollector] Location parse error: {e}")
+        except Exception as e:
+            print(f"[DataCollector] Location UDP bind failed: {e}")
+        finally:
+            sock.close()
     def _process(self, msg):
         cid = msg.arbitration_id
         try:
@@ -684,20 +717,20 @@ class DataCollector:
         except Exception:
             pass
 
-    def _simulate(self):
-        import random
-        while self.running:
-            s = self.state
-            s['speed_kmh']     = max(0, s.get('speed_kmh',     50) + random.gauss(0, 2))
-            s['battery_level'] = max(0, min(100, s.get('battery_level', 80) - 0.01))
-            s['throttle']      = max(0, min(1, 0.3 + random.gauss(0, 0.1)))
-            s['brake']         = max(0, min(1, abs(random.gauss(0, 0.05))))
-            s['steering']      = random.gauss(0, 0.1)
-            s['gear']          = float(random.randint(0, 5))
-            s['location_x']    = s.get('location_x', 0) + random.gauss(0, 0.5)
-            s['location_y']    = s.get('location_y', 0) + random.gauss(0, 0.5)
-            self._push()
-            time.sleep(0.1)
+    # def _simulate(self):
+    #     import random
+    #     while self.running:
+    #         s = self.state
+    #         s['speed_kmh']     = max(0, s.get('speed_kmh',     50) + random.gauss(0, 2))
+    #         s['battery_level'] = max(0, min(100, s.get('battery_level', 80) - 0.01))
+    #         s['throttle']      = max(0, min(1, 0.3 + random.gauss(0, 0.1)))
+    #         s['brake']         = max(0, min(1, abs(random.gauss(0, 0.05))))
+    #         s['steering']      = random.gauss(0, 0.1)
+    #         s['gear']          = float(random.randint(0, 5))
+    #         s['location_x']    = s.get('location_x', 0) + random.gauss(0, 0.5)
+    #         s['location_y']    = s.get('location_y', 0) + random.gauss(0, 0.5)
+    #         self._push()
+    #         time.sleep(0.1)
 
     def _push(self):
         row = np.array([self.state.get(n, 0.0)
