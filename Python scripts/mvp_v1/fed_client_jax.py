@@ -271,7 +271,7 @@ def init_adam(params):
     v = {k: jnp.zeros_like(v) for k, v in params.items()}
     return m, v, 0
 
-
+@jax.jit
 def adam_step(params, grads, m, v, step,
               lr=LR, b1=0.9, b2=0.999, eps=1e-8):
     """
@@ -318,7 +318,7 @@ class GRUAutoencoder:
     _BETA2 = 0.999
     _EPS   = 1e-8
 
-    def __init__(self):
+    def __init__(self, seed: int = 42):
         self.threshold  = float('inf')
         self.calibrated = False
         self.is_loaded  = True
@@ -326,6 +326,7 @@ class GRUAutoencoder:
 
         self.params       = init_params()
         self.adam_m, self.adam_v, self.adam_t = init_adam(self.params)
+        self.rng_key = jax.random.PRNGKey(seed)
 
         # Warm up JIT — first call compiles, subsequent calls are fast.
         # Do this at init so the first real training step is not slow.
@@ -389,8 +390,11 @@ class GRUAutoencoder:
         x_seq   = x_flat.reshape(-1, WINDOW_SIZE, N_FEATURES)
 
         # Denoising: add noise to encoder input, reconstruct clean target
-        noise_key = jax.random.PRNGKey(int(time.time_ns()) % (2**31))
-        noise     = jax.random.normal(noise_key, x_seq.shape) * NOISE_STD
+        # noise_key = jax.random.PRNGKey(int(time.time_ns()) % (2**31))
+        self.rng_key, sub = jax.random.split(self.rng_key)
+        # noise     = jax.random.normal(noise_key, x_seq.shape) * NOISE_STD
+        noise = jax.random.normal(sub, x_seq.shape) * NOISE_STD
+
         x_noisy   = x_seq + noise
 
         with self._lock:
@@ -569,11 +573,16 @@ class FederationTrigger:
         self.ref_loss          = None
         self.last_fed_time     = time.time()
         self.adaptive_interval = FED_BASE_INTERVAL
+        self._last_sent_round = None
+        
 
     def store_reference(self, weights: list, loss: float):
         self.ref_weights   = [w.copy() for w in weights]
         self.ref_loss      = loss
         self.last_fed_time = time.time()
+
+    def mark_sent(self, current_round: int) -> None:          
+        self._last_sent_round = current_round
 
     def _divergence(self, current_weights: list) -> float:
         if not self.ref_weights:
@@ -583,12 +592,14 @@ class FederationTrigger:
         total_n     = sum(c.size for c in current_weights)
         return float(np.sqrt(total_delta / max(total_n, 1)))
 
-    def should_federate(self, current_weights: list, current_loss: float):
+    def should_federate(self, current_round: int, current_weights: list, current_loss: float):
         elapsed     = time.time() - self.last_fed_time
         divergence  = self._divergence(current_weights)
         loss_change = (abs(current_loss - self.ref_loss) / max(self.ref_loss, 1e-8)
                        if self.ref_loss is not None else float('inf'))
 
+        if current_round == self._last_sent_round:
+            return False, "already_sent_this_round" 
         # First-ever federation: no reference weights yet, send immediately
         if self.ref_weights is None:
             return True, "initial_federation"
@@ -672,6 +683,7 @@ class DataCollector:
                         self._process(msg)
             except Exception as e:
                 print(f"[DataCollector] CAN error: {e} — retrying in 5s")
+                time.sleep(5)
                 # self._simulate()
             finally:
                 if bus is not None:
@@ -713,7 +725,7 @@ class DataCollector:
             v = struct.unpack('<f', msg.data[:4])[0]
             if cid in self.can_id_map:
                 self.state[self.can_id_map[cid]] = v
-            self._push()
+                self._push()
         except Exception:
             pass
 
@@ -985,12 +997,14 @@ class FederatedClient:
             print(f"[Client {self.client_id}] Server-requested send — bypassing trigger")
             self._send_weight_update(current_weights, avg_loss, len(windows))
             self.trigger.store_reference(current_weights, avg_loss)
+            self.trigger.mark_sent(self.current_round)
         else:
             should_fed, reason = self.trigger.should_federate(
-                current_weights, avg_loss)
+                self.current_round,current_weights, avg_loss)
             if should_fed and self.rollback.is_improving():
                 self._send_weight_update(current_weights, avg_loss, len(windows))
                 self.trigger.store_reference(current_weights, avg_loss)
+                self.trigger.mark_sent(self.current_round)
             else:
                 print(f"[Client] Federation: {reason}")
 
