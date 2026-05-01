@@ -1,29 +1,11 @@
 """
 ================================================================================
-  evaluate_mvp.py — minimum viable evaluation: GRU autoencoder vs Isolation Forest
+  evaluate_mvp.py — GRU autoencoder vs Isolation Forest on CARLA telemetry
 
-  Purpose
-  -------
-  Prove (or disprove) that the GRU sequence-to-sequence autoencoder used by the
-  federated IDS catches attacks that an Isolation Forest baseline misses, on
-  the same vehicle telemetry, with the same calibration.
-
-  Usage
-  -----
+  Run:
       pip install scikit-learn pandas pyarrow
       python evaluate_mvp.py path/to/telemetry.parquet
       python evaluate_mvp.py path/to/folder_of_parquets/
-
-  What it does
-  ------------
-  1. Loads parquet telemetry; auto-resolves column names; drops location_z.
-  2. Splits sequentially 80% train / 20% test (no temporal leakage).
-  3. Trains both detectors on the same training windows.
-  4. Sets each detector's threshold at p99 × 1.5 of its own training errors.
-  5. Injects four attack families into the test set: spike, drift, frequency,
-     splice. Three of the four preserve marginal statistics, so an IID
-     detector should miss them — that is the test.
-  6. Prints AUROC, F1, per-attack detection rates, and inference latency.
 ================================================================================
 """
 
@@ -43,7 +25,6 @@ try:
 except ImportError:
     sys.exit("Install deps:  pip install scikit-learn pandas pyarrow")
 
-# Reuse the production GRU exactly — what we evaluate is what runs on the Pi.
 try:
     from fed_client_jax import (
         ANOMALY_PERCENTILE,
@@ -57,14 +38,13 @@ except ImportError as e:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Parquet loading (column auto-detection, drops location_z + timestamp)
+# Parquet loading
 # ──────────────────────────────────────────────────────────────────────────────
 
 FEATURES = ("speed_kmh", "battery_level", "throttle", "brake",
             "steering", "gear", "location_x", "location_y")
 assert len(FEATURES) == N_FEATURES
 
-# Permissive aliases so different CARLA loggers all work.
 ALIASES = {
     "speed_kmh":     ("speed_kmh", "speed", "velocity"),
     "battery_level": ("battery_level", "battery", "soc"),
@@ -78,17 +58,13 @@ ALIASES = {
 
 
 def load_parquet(path: str) -> np.ndarray:
-    """Load one file or every .parquet under a directory; return (N, 8) array."""
     p = Path(path)
     files = sorted(p.rglob("*.parquet")) if p.is_dir() else [p]
     if not files:
         sys.exit(f"No parquet files at {path}")
+    df = pd.concat([pd.read_parquet(f) for f in files], ignore_index=True)
+    print(f"[Data] loaded {len(df):,} rows from {len(files)} file(s)")
 
-    dfs = [pd.read_parquet(f) for f in files]
-    df  = pd.concat(dfs, ignore_index=True)
-    print(f"[Data] loaded {len(df)} rows from {len(files)} file(s)")
-
-    # Resolve aliases case-insensitively.
     cols_lower = {c.lower(): c for c in df.columns}
     chosen: dict[str, str] = {}
     for canonical in FEATURES:
@@ -98,11 +74,11 @@ def load_parquet(path: str) -> np.ndarray:
                 break
         else:
             sys.exit(f"Missing required feature {canonical!r}.  "
-                     f"Available columns: {list(df.columns)}")
+                     f"Available: {list(df.columns)}")
 
-    print(f"[Data] using columns: " +
+    print(f"[Data] using columns:  " +
           ", ".join(f"{k}←{v}" for k, v in chosen.items()))
-    print(f"[Data] dropped: " +
+    print(f"[Data] dropped:        " +
           ", ".join(c for c in df.columns if c not in chosen.values()))
 
     arr = df[[chosen[c] for c in FEATURES]].to_numpy(dtype=np.float32)
@@ -110,85 +86,91 @@ def load_parquet(path: str) -> np.ndarray:
 
 
 def to_windows(trace: np.ndarray, mu=None, sd=None):
-    """Z-score, then slide. Same as DataCollector.get_windows."""
     if mu is None:
         mu = trace.mean(axis=0)
         sd = np.where(trace.std(axis=0) > 1e-6, trace.std(axis=0), 1.0)
     norm = ((trace - mu) / sd).astype(np.float32)
-    out  = np.stack([norm[i:i + WINDOW_SIZE].flatten()
-                     for i in range(len(norm) - WINDOW_SIZE + 1)])
+    out = np.stack([norm[i:i + WINDOW_SIZE].flatten()
+                    for i in range(len(norm) - WINDOW_SIZE + 1)])
     return out, mu, sd
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Detector wrappers — identical interface so the harness can treat them alike
+# Detectors
 # ──────────────────────────────────────────────────────────────────────────────
 
 class IForestDetector:
-    """Baseline IDS: treats every 160-D window as an IID feature vector."""
     def __init__(self):
-        self.model     = IsolationForest(n_estimators=200, random_state=42, n_jobs=-1)
+        self.model = IsolationForest(n_estimators=200, random_state=42, n_jobs=-1)
         self.threshold = float("inf")
 
     def fit(self, windows):
         self.model.fit(windows)
 
     def score(self, w):
-        # sklearn: high score = normal. Negate so high = anomalous (matches GRU).
         return -float(self.model.score_samples(w.reshape(1, -1))[0])
 
-    def calibrate(self, windows):
-        errs = np.array([self.score(w) for w in windows[:300]])
-        self.threshold = float(np.percentile(errs, ANOMALY_PERCENTILE)
-                               * ANOMALY_SAFETY_MULT)
+    def score_batch(self, windows):
+        # Vectorised — much faster than the per-row .score() Python loop.
+        return -self.model.score_samples(windows)
 
 
 class GRUDetector:
-    """Wraps the production GRU autoencoder with the same .score/.calibrate API."""
     def __init__(self):
-        self.model     = GRUAutoencoder(seed=42)
+        self.model = GRUAutoencoder(seed=42)
         self.threshold = float("inf")
 
     def fit(self, windows, epochs=20, batch_size=32):
         for ep in range(epochs):
-            perm   = np.random.permutation(len(windows))
-            losses = [self.model.train_step(windows[perm[i:i + batch_size]])
-                      for i in range(0, len(windows), batch_size)
-                      if len(windows[perm[i:i + batch_size]]) > 0]
+            perm = np.random.permutation(len(windows))
+            losses = []
+            for i in range(0, len(windows), batch_size):
+                b = windows[perm[i:i + batch_size]]
+                if len(b):
+                    losses.append(self.model.train_step(b))
             if (ep + 1) % 5 == 0:
-                print(f"  GRU epoch {ep+1}/{epochs}  loss={np.mean(losses):.5f}")
+                print(f"  GRU epoch {ep+1:2d}/{epochs}  loss={np.mean(losses):.5f}")
 
     def score(self, w):
         return float(self.model.reconstruction_error(w))
 
-    def calibrate(self, windows):
-        errs = np.array([self.score(w) for w in windows[:300]])
-        self.threshold = float(np.percentile(errs, ANOMALY_PERCENTILE)
-                               * ANOMALY_SAFETY_MULT)
+
+def calibrate_uniform(detector, train_windows, n_samples=2000, kind="batch"):
+    """
+    Sample calibration windows UNIFORMLY across the training set
+    (not the first N — those are typically degenerate launch frames).
+    """
+    n = len(train_windows)
+    take = min(n_samples, n)
+    idx = np.linspace(0, n - 1, take, dtype=int)
+    samples = train_windows[idx]
+    if kind == "batch":
+        errs = detector.score_batch(samples)
+    else:
+        errs = np.array([detector.score(w) for w in samples])
+    p99 = float(np.percentile(errs, ANOMALY_PERCENTILE))
+    detector.threshold = p99 * ANOMALY_SAFETY_MULT
+    return errs
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Attack injectors — each targets a different IID-detector blind spot
+# Attacks (operate on z-scored windows; magnitudes are in std-deviations)
 # ──────────────────────────────────────────────────────────────────────────────
-# spike     : single huge outlier  → both should catch (sanity check)
-# drift     : slow ramp on speed   → marginal stats preserved, IF blind
-# frequency : high-freq steering   → marginal stats preserved, IF blind
-# splice    : mid-window cutover   → marginal stats preserved, IF blind
 
-def attack_spike(w, rng):
+def attack_spike(w, rng, magnitude=8.0):
     s = w.reshape(WINDOW_SIZE, N_FEATURES).copy()
-    s[rng.integers(WINDOW_SIZE), rng.integers(N_FEATURES)] += 6.0
+    s[rng.integers(WINDOW_SIZE), rng.integers(N_FEATURES)] += magnitude
     return s.flatten()
 
-def attack_drift(w, rng):
+def attack_drift(w, rng, magnitude=3.0):
     s = w.reshape(WINDOW_SIZE, N_FEATURES).copy()
     half = WINDOW_SIZE // 2
-    s[half:, 0] += np.linspace(0, 1.6, WINDOW_SIZE - half, dtype=np.float32)
+    s[half:, 0] += np.linspace(0, magnitude, WINDOW_SIZE - half, dtype=np.float32)
     return s.flatten()
 
-def attack_frequency(w, rng):
+def attack_frequency(w, rng, amplitude=2.0):
     s = w.reshape(WINDOW_SIZE, N_FEATURES).copy()
-    s[:, 4] = np.sin(np.pi * np.arange(WINDOW_SIZE, dtype=np.float32))   # steering
+    s[:, 4] = amplitude * np.sin(np.pi * np.arange(WINDOW_SIZE, dtype=np.float32))
     return s.flatten()
 
 def attack_splice(w_a, w_b, rng):
@@ -202,111 +184,195 @@ ATTACKS = {"spike": attack_spike, "drift": attack_drift,
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Diagnostics
+# ──────────────────────────────────────────────────────────────────────────────
+
+def score_dist(scores: np.ndarray) -> str:
+    return (f"mean={scores.mean():.3f}  "
+            f"p50={np.percentile(scores, 50):.3f}  "
+            f"p95={np.percentile(scores, 95):.3f}  "
+            f"p99={np.percentile(scores, 99):.3f}  "
+            f"max={scores.max():.3f}")
+
+
+def best_threshold(scores: np.ndarray, labels: np.ndarray):
+    """
+    Sweep thresholds, return the one that maximises F1.
+    Decouples model quality from threshold-calibration quality.
+    """
+    candidates = np.unique(np.percentile(scores, np.linspace(50, 99.9, 200)))
+    best = (float(np.median(scores)), 0.0, 0.0, 0.0)
+    for t in candidates:
+        pred = (scores > t).astype(int)
+        tp = int(((pred == 1) & (labels == 1)).sum())
+        fp = int(((pred == 1) & (labels == 0)).sum())
+        fn = int(((pred == 0) & (labels == 1)).sum())
+        if tp == 0:
+            continue
+        prec = tp / (tp + fp)
+        rec  = tp / (tp + fn)
+        f1   = 2 * prec * rec / (prec + rec)
+        if f1 > best[1]:
+            best = (float(t), f1, prec, rec)
+    return best
+
+
+def report(name, scores, labels, kinds, threshold, latencies_us):
+    print(f"\n  ── {name} ─────────────────────────────────────────────────────")
+    print(f"    calibrated threshold:        {threshold:.4f}")
+    print(f"    benign score dist:           {score_dist(scores[labels == 0])}")
+    for k in ATTACKS:
+        m = (kinds == k) & (labels == 1)
+        if m.any():
+            print(f"    {k:<10} score dist:       {score_dist(scores[m])}")
+
+    # Per-attack AUROC (each family vs benign) — threshold-independent.
+    # Tells us whether the score *ranks* attacks above benign at all.
+    print(f"    per-attack AUROC vs benign:")
+    benign_scores = scores[labels == 0]
+    for k in ATTACKS:
+        m = (kinds == k) & (labels == 1)
+        if m.any():
+            y = np.concatenate([np.zeros(len(benign_scores)), np.ones(m.sum())])
+            s = np.concatenate([benign_scores, scores[m]])
+            auc = roc_auc_score(y, s)
+            print(f"      {k:<10}                  {auc:.3f}")
+
+    overall_auc = roc_auc_score(labels, scores)
+    pred = (scores > threshold).astype(int)
+    f1c = f1_score(labels, pred, zero_division=0)
+    fpc = float(pred[labels == 0].mean())
+    rec = float(pred[labels == 1].mean())
+
+    bt, bf1, bp, br = best_threshold(scores, labels)
+    print(f"    overall AUROC:               {overall_auc:.3f}")
+    print(f"    @ calibrated threshold:      F1={f1c:.3f}  recall={rec:.3f}  FP={fpc:.3f}")
+    print(f"    @ optimal threshold {bt:>7.3f}: F1={bf1:.3f}  precision={bp:.3f}  recall={br:.3f}")
+    print(f"    latency p50 / p99 (µs):      {np.percentile(latencies_us, 50):.1f}  /  "
+          f"{np.percentile(latencies_us, 99):.1f}")
+
+    return {"auroc": overall_auc, "f1_calibrated": f1c, "f1_optimal": bf1,
+            "lat_p50": float(np.percentile(latencies_us, 50)),
+            "lat_p99": float(np.percentile(latencies_us, 99))}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Main
 # ──────────────────────────────────────────────────────────────────────────────
 
-def evaluate(detector, name, test_windows, labels, kinds):
-    """Score every window, time each call, return a results dict."""
-    scores, lat = [], []
-    for w in test_windows:
-        t0 = time.perf_counter()
-        scores.append(detector.score(w))
-        lat.append((time.perf_counter() - t0) * 1e6)
-    scores = np.array(scores)
-    preds  = (scores > detector.threshold).astype(int)
-    per_attack = {k: float(preds[(kinds == k) & (labels == 1)].mean())
-                  for k in ATTACKS}
-    return {
-        "name":      name,
-        "auroc":     float(roc_auc_score(labels, scores)),
-        "f1":        float(f1_score(labels, preds, zero_division=0)),
-        "fp_rate":   float(preds[labels == 0].mean()),
-        "per_attack": per_attack,
-        "lat_p50":   float(np.percentile(lat, 50)),
-        "lat_p99":   float(np.percentile(lat, 99)),
-    }
-
-
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("parquet", help="parquet file or directory of parquet files")
-    ap.add_argument("--train-ratio", type=float, default=0.80,
-                    help="fraction of frames used to train both detectors (default 0.80)")
-    ap.add_argument("--attack-rate", type=float, default=0.30,
-                    help="fraction of test windows that get attacks injected")
+    ap.add_argument("parquet", help="parquet file or directory")
+    ap.add_argument("--train-ratio", type=float, default=0.80)
+    ap.add_argument("--attack-rate", type=float, default=0.30)
+    ap.add_argument("--max-test-windows", type=int, default=20_000,
+                    help="cap test set size — IForest scoring is O(n·trees) per call")
     args = ap.parse_args()
 
     np.random.seed(42)
     rng = np.random.default_rng(42)
 
-    # Load and split sequentially (no shuffling — would leak future into past).
+    # ── Load + sequential split ──────────────────────────────────────────
     trace = load_parquet(args.parquet)
-    cut   = int(len(trace) * args.train_ratio)
+    cut = int(len(trace) * args.train_ratio)
     train_trace, test_trace = trace[:cut], trace[cut:]
-    print(f"[Split] train={len(train_trace)} frames   test={len(test_trace)} frames")
+    print(f"[Split] train={len(train_trace):,}  test={len(test_trace):,}  "
+          f"(sequential — no leakage)")
 
-    train_w, mu, sd  = to_windows(train_trace)
+    train_w, mu, sd = to_windows(train_trace)
     test_w_clean, *_ = to_windows(test_trace, mu, sd)
-    if len(train_w) < 50 or len(test_w_clean) < 50:
-        sys.exit("Not enough data — need a longer parquet trace.")
+    print(f"[Windows] train={len(train_w):,}  test={len(test_w_clean):,}")
 
-    # Build attacked test set.
+    # Subsample test set if huge — keeps IForest scoring tractable.
+    if len(test_w_clean) > args.max_test_windows:
+        idx = np.linspace(0, len(test_w_clean) - 1, args.max_test_windows, dtype=int)
+        test_w_clean = test_w_clean[idx]
+        print(f"[Windows] test subsampled to {len(test_w_clean):,} (uniform across trace)")
+
+    # ── Inject attacks ───────────────────────────────────────────────────
     n_atk = int(len(test_w_clean) * args.attack_rate)
-    idxs  = rng.choice(len(test_w_clean), n_atk, replace=False)
+    atk_idx = rng.choice(len(test_w_clean), n_atk, replace=False)
     test_w = test_w_clean.copy()
     labels = np.zeros(len(test_w), dtype=int)
-    kinds  = np.array(["benign"] * len(test_w), dtype=object)
+    kinds = np.array(["benign"] * len(test_w), dtype=object)
     families = list(ATTACKS)
-    for j, i in enumerate(idxs):
-        k = families[j % 4]
+    for j, i in enumerate(atk_idx):
+        k = families[j % len(families)]
         if k == "splice":
             donor = test_w_clean[(i + len(test_w) // 2) % len(test_w)]
             test_w[i] = ATTACKS[k](test_w_clean[i], donor, rng)
         else:
             test_w[i] = ATTACKS[k](test_w_clean[i], rng)
         labels[i] = 1
-        kinds[i]  = k
-    print(f"[Attacks] injected {n_atk} attacks across {len(families)} families")
+        kinds[i] = k
+    print(f"[Attacks] " + ", ".join(f"{k}={int((kinds == k).sum())}" for k in families))
 
-    # Train + calibrate both.
+    # ── Train ────────────────────────────────────────────────────────────
     print("\n[IForest] fitting...")
+    t0 = time.perf_counter()
     iforest = IForestDetector()
     iforest.fit(train_w)
-    iforest.calibrate(train_w)
-    print(f"[IForest] threshold = {iforest.threshold:.4f}")
+    print(f"[IForest] fit done ({time.perf_counter() - t0:.1f}s)")
 
-    print("\n[GRU] training...")
+    print("\n[GRU] training (20 epochs)...")
+    t0 = time.perf_counter()
     gru = GRUDetector()
     gru.fit(train_w)
-    gru.calibrate(train_w)
-    print(f"[GRU] threshold = {gru.threshold:.4f}")
+    print(f"[GRU] training done ({time.perf_counter() - t0:.1f}s)")
 
-    # Score and report.
-    print("\n[Eval] scoring test set with both detectors...")
-    r_if  = evaluate(iforest, "IForest", test_w, labels, kinds)
-    r_gru = evaluate(gru,     "GRU",     test_w, labels, kinds)
+    # ── Calibrate (uniform sample, NOT the first 300 frames) ─────────────
+    print("\n[Calibration] sampling 2000 windows uniformly across training set...")
+    if_calib = calibrate_uniform(iforest, train_w, kind="batch")
+    print(f"[IForest] calib err dist:  {score_dist(if_calib)}")
+    print(f"[IForest] threshold:       {iforest.threshold:.4f}  "
+          f"(p{ANOMALY_PERCENTILE} × {ANOMALY_SAFETY_MULT})")
 
-    print("\n" + "=" * 64)
-    print(f"  {'metric':<22}{'IForest':>14}{'GRU':>14}{'Δ':>10}")
-    print("-" * 64)
-    for key, label in [("auroc", "AUROC"), ("f1", "F1"),
-                       ("fp_rate", "False-pos rate"),
-                       ("lat_p50", "Latency p50 (µs)"),
-                       ("lat_p99", "Latency p99 (µs)")]:
-        a, b = r_if[key], r_gru[key]
-        print(f"  {label:<22}{a:>14.3f}{b:>14.3f}{b-a:>+10.3f}")
-    print("\n  Per-attack detection rate:")
-    for k in ATTACKS:
-        a, b = r_if["per_attack"][k], r_gru["per_attack"][k]
-        print(f"    {k:<20}{a:>14.3f}{b:>14.3f}{b-a:>+10.3f}")
-    print("=" * 64)
+    gru_calib = calibrate_uniform(gru, train_w, kind="loop")
+    print(f"[GRU]     calib err dist:  {score_dist(gru_calib)}")
+    print(f"[GRU]     threshold:       {gru.threshold:.4f}  "
+          f"(p{ANOMALY_PERCENTILE} × {ANOMALY_SAFETY_MULT})")
 
-    if r_gru["auroc"] > r_if["auroc"] + 0.05:
-        print("\nVerdict: GRU clearly outperforms Isolation Forest.")
-    elif r_gru["auroc"] > r_if["auroc"]:
-        print("\nVerdict: GRU edges ahead — gain may not justify cost.")
-    else:
-        print("\nVerdict: IForest competitive; investigate why GRU isn't winning.")
+    # ── Score test set ───────────────────────────────────────────────────
+    print("\n[Eval] scoring test set...")
+    t0 = time.perf_counter()
+    if_scores = iforest.score_batch(test_w)
+    if_total = (time.perf_counter() - t0) * 1e6
+    if_lat = np.full(len(test_w), if_total / len(test_w))   # batch — equal share
+    print(f"[IForest] {len(test_w):,} windows in {if_total/1e6:.1f}s "
+          f"({if_total/len(test_w):.1f} µs/window amortised)")
+
+    print("[GRU] per-window scoring...")
+    gru_scores = np.empty(len(test_w))
+    gru_lat = np.empty(len(test_w))
+    for i, w in enumerate(test_w):
+        t0 = time.perf_counter()
+        gru_scores[i] = gru.score(w)
+        gru_lat[i] = (time.perf_counter() - t0) * 1e6
+
+    # ── Report ───────────────────────────────────────────────────────────
+    print("\n" + "=" * 72)
+    print("  RESULTS")
+    print("=" * 72)
+    r_if = report("IForest", if_scores, labels, kinds, iforest.threshold, if_lat)
+    r_gru = report("GRU", gru_scores, labels, kinds, gru.threshold, gru_lat)
+
+    print("\n" + "=" * 72)
+    print("  HEAD-TO-HEAD")
+    print("=" * 72)
+    fmt = "  {:<28}{:>14}{:>14}{:>10}"
+    print(fmt.format("metric", "IForest", "GRU", "Δ"))
+    for k, lbl in [("auroc",         "AUROC (overall)"),
+                   ("f1_calibrated", "F1 @ calibrated thr"),
+                   ("f1_optimal",    "F1 @ optimal thr"),
+                   ("lat_p50",       "Latency p50 (µs)"),
+                   ("lat_p99",       "Latency p99 (µs)")]:
+        a, b = r_if[k], r_gru[k]
+        print(fmt.format(lbl, f"{a:.3f}", f"{b:.3f}", f"{b-a:+.3f}"))
+
+    print("\nReading the results:")
+    print("  • AUROC and F1@optimal show what each detector CAN do (model quality).")
+    print("  • F1@calibrated shows what they DO at the deployed threshold.")
+    print("  • If F1@optimal >> F1@calibrated, threshold is the bottleneck, not the model.")
 
 
 if __name__ == "__main__":
