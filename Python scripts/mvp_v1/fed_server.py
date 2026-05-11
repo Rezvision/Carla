@@ -113,9 +113,9 @@ MIN_CLIENTS    = 2           # minimum updates before triggering FedAvg
 # or by client-count variance (e.g. only 1 client contributed one round).
 EARLY_INTERVAL_SEC         = 900     # 15 minutes
 LATE_INTERVAL_SEC          = 3600    # 60 minutes
-LOSS_IMPROVEMENT_THRESHOLD = 0.05    # 5% relative improvement triggers switch
+LOSS_IMPROVEMENT_THRESHOLD = 0.02    # 2% relative improvement triggers switch
 MIN_EARLY_ROUNDS           = 5       # must complete this many rounds before early→late
-
+CONSECUTIVE_STALL_ROUNDS   = 3       # number of consecutive rounds with < threshold improvement to switch phases
 CHECKPOINT_DIR = "./models/checkpoints"
 
 # ── GRU architecture constants (must match fed_client.py exactly) ─────────────
@@ -370,6 +370,7 @@ class FederatedServer:
         self.round_interval = EARLY_INTERVAL_SEC   # start in fast mode
         self.phase          = "early"               # "early" or "late"
         self.loss_history   = []                    # avg_loss per round
+        self.stall_streak = 0                   # consecutive rounds with < threshold improvement
 
     # ── MQTT ──────────────────────────────────────────────────────────────────
 
@@ -494,25 +495,41 @@ class FederatedServer:
 
             # ── Adaptive phase switching ──────────────────────────────────
             # Track loss and switch from early→late when improvement stalls
+            # Switch early → late only after CONSECUTIVE_STALL_ROUNDS rounds
+            # in a row each show a *positive* improvement smaller than the
+            # threshold. A regression (improvement <= 0) or a big jump
+            # (improvement >= threshold) resets the streak.
             self.loss_history.append(avg_loss)
             if (self.phase == "early"
                     and len(self.loss_history) >= MIN_EARLY_ROUNDS
                     and self.loss_history[-2] > 0):
                 prev_loss = self.loss_history[-2]
                 improvement = (prev_loss - avg_loss) / prev_loss
-
-                print(f"[Scheduler] Loss: {avg_loss:.6f} | "
-                      f"Prev: {prev_loss:.6f} | "
-                      f"Improvement: {improvement:.2%}")
-
                 if 0 < improvement < LOSS_IMPROVEMENT_THRESHOLD:
+                    self.stall_streak += 1
+                    print(f"[Scheduler] Loss: {avg_loss:.6f} | "
+                        f"Prev: {prev_loss:.6f} | "
+                        f"Improvement: {improvement:.2%} | "
+                        f"Stall streak: {self.stall_streak}/{CONSECUTIVE_STALL_ROUNDS}")
+                else:
+                    if self.stall_streak > 0:
+                        print(f"[Scheduler] Stall streak reset "
+                            f"(was {self.stall_streak}) — "
+                            f"improvement={improvement:.2%} "
+                            f"outside (0, {LOSS_IMPROVEMENT_THRESHOLD:.0%})")
+                    self.stall_streak = 0
+                    print(f"[Scheduler] Loss: {avg_loss:.6f} | "
+                        f"Prev: {prev_loss:.6f} | "
+                        f"Improvement: {improvement:.2%}")
+
+                if self.stall_streak >= CONSECUTIVE_STALL_ROUNDS:
                     self.phase = "late"
                     self.round_interval = LATE_INTERVAL_SEC
                     print(f"[Scheduler] *** PHASE SWITCH: early → late ***")
-                    print(f"[Scheduler] Loss improvement {improvement:.2%} "
-                          f"< {LOSS_IMPROVEMENT_THRESHOLD:.0%} threshold")
+                    print(f"[Scheduler] {CONSECUTIVE_STALL_ROUNDS} consecutive rounds "
+                        f"with 0 < improvement < {LOSS_IMPROVEMENT_THRESHOLD:.0%}")
                     print(f"[Scheduler] Round interval now "
-                          f"{LATE_INTERVAL_SEC/60:.0f} min")
+                        f"{LATE_INTERVAL_SEC/60:.0f} min")
             # ──────────────────────────────────────────────────────────────
 
             # Broadcast to all Pi clients
