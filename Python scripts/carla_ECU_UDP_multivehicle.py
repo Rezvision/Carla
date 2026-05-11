@@ -169,7 +169,7 @@ def send_location(sock, data, idx):
     sock.sendto(loc.encode(), (PI_IPS[idx], LOCATION_PORTS[idx]))
 
 
-def cleanup(vehicles, sockets, loc_sockets, loggers):
+def cleanup(vehicles, sockets, loc_sockets, loggers, alive):
     for logger in loggers:
         logger.close()
     for sock in sockets:
@@ -177,8 +177,9 @@ def cleanup(vehicles, sockets, loc_sockets, loggers):
             s.close()
     for s in loc_sockets:
         s.close()
-    for v in vehicles:
-        v.destroy()
+    for i, v in enumerate(vehicles):
+        if alive[i] and v.is_alive:
+            v.destroy()
     print(f"\nLogs saved to {LOG_DIR}/")
 
 
@@ -192,22 +193,32 @@ if __name__ == "__main__":
     sockets, loc_sockets = setup_sockets(NUM_VEHICLES)
     loggers = [DataLogger(i) for i in range(NUM_VEHICLES)]
     batteries = [100.0] * NUM_VEHICLES
-    
+    alive = [True] * NUM_VEHICLES
+
     try:
-        while True:
+        while any(alive):
             for i, vehicle in enumerate(vehicles):
-                if not vehicle.is_alive:
+                if not alive[i]:
                     continue
                 data, batteries[i] = get_data(vehicle, batteries[i])
                 data['timestamp'] = datetime.now().isoformat()
-                
+
                 send_udp(sockets[i], data, i)
                 send_location(loc_sockets[i], data, i)
                 loggers[i].log(data)
-            
+
+                if batteries[i] <= 0:
+                    print(f"[Vehicle {i+1}] Battery depleted - destroying vehicle")
+                    loggers[i].close()
+                    if vehicle.is_alive:
+                        vehicle.destroy()
+                    alive[i] = False
+
             time.sleep(0.05)  # 20 Hz
-            
+
+        print("\nAll vehicles depleted. Run complete.")
+
     except KeyboardInterrupt:
         pass
     finally:
-        cleanup(vehicles, sockets, loc_sockets, loggers)
+        cleanup(vehicles, sockets, loc_sockets, loggers, alive)
