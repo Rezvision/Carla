@@ -35,10 +35,11 @@ import paho.mqtt.client as mqtt
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 INPUT_DIM            = 160
 WINDOW_SIZE          = 20
+WINDOW_INTRA_STRIDE = 20            # 20 with 20 Hz collection = 1 Hz effective windowing
 N_FEATURES           = 8
 GRU_HIDDEN           = 32
 LOCAL_TRAIN_INTERVAL = 300
-MIN_BUFFER_FRAMES    = 200
+MIN_BUFFER_FRAMES    = 400
 LOCAL_EPOCHS         = 3
 BATCH_SIZE           = 32
 LR                   = 0.001
@@ -750,14 +751,34 @@ class DataCollector:
         self.buffer.append(row)
         self.frame_count += 1
 
-    def fit_scaler(self):
-        if len(self.buffer) < 50:
-            return
-        data      = np.array(list(self.buffer))
+    def fit_scaler(self, min_frames: int = WINDOW_SIZE * WINDOW_INTRA_STRIDE,
+               refit: bool = False):
+        """
+        Fit per-feature mean and std from the current buffer.
+
+        The scaler should see enough data to represent the operating envelope
+        of the vehicle, not just the first few seconds after startup. With
+        1-Hz windowing, a single window spans WINDOW_SIZE * WINDOW_INTRA_STRIDE
+        = 400 raw frames at 20 Hz, so the scaler needs at least that many
+        samples to be even minimally meaningful. We default to 2000 frames
+        (~100 s at 20 Hz) to capture some real variation.
+
+        Pass refit=True to rescore against the current buffer even if the
+        scaler was previously fitted. This should be called periodically by
+        the training loop so the scaler tracks the operating distribution
+        as it evolves over the trip.
+        """
+        if len(self.buffer) < min_frames:
+            return False
+        if self.scaler_fitted and not refit:
+            return False
+
+        data = np.array(list(self.buffer), dtype=np.float32)
         self.mean = data.mean(axis=0).astype(np.float32)
         self.std  = np.where(data.std(axis=0) > 1e-6,
-                             data.std(axis=0), 1.0).astype(np.float32)
+                            data.std(axis=0), 1.0).astype(np.float32)
         self.scaler_fitted = True
+        return True
 
     def _normalise(self, data: np.ndarray) -> np.ndarray:
         return (data - self.mean) / self.std
@@ -765,28 +786,56 @@ class DataCollector:
     def ready(self) -> bool:
         return len(self.buffer) >= MIN_BUFFER_FRAMES
 
-    def get_windows(self, stride: int = 20,
-                    max_windows: int = 400) -> np.ndarray:
-        """Return (N, 160) normalised sliding-window array. Stride=20 default."""
+    def get_windows(self,
+                step: int = 20,
+                intra_stride: int = 20,
+                max_windows: int = 400) -> np.ndarray:
+        """Return (N, 160) normalised sliding-window array.
+
+    Two stride parameters control windowing:
+      intra_stride: spacing between frames *within* one window.
+                    With 20 Hz collection, intra_stride=20 gives
+                    1-Hz effective windowing (each window covers
+                    20 frames spaced 1 second apart = 20 seconds).
+                    intra_stride=1 gives the old 20-Hz windowing
+                    (20 consecutive frames = 1 second).
+      step:         how far the start of the next window advances.
+                    step=20 with intra_stride=20 gives non-overlapping
+                    windows (each new window starts 1 s after the
+                    previous one).
+
+    With the defaults, one window covers 20 seconds of driving and
+    the model sees a fresh window every second."""
         if not self.ready():
             return None
         if not self.scaler_fitted:
             self.fit_scaler()
         data = self._normalise(np.array(list(self.buffer), dtype=np.float32))
+        span = WINDOW_SIZE * intra_stride          # raw frames each window covers
+        if len(data) < span:
+            return None
         out  = []
-        for i in range(0, min(len(data) - WINDOW_SIZE,
-                              max_windows * stride), stride):
-            out.append(data[i:i + WINDOW_SIZE].flatten())
+        end = min(len(data) - span + 1, max_windows * step)
+
+        for i in range(0, end, step):
+            out.append(data[i : i + span : intra_stride].flatten())
         return np.array(out, dtype=np.float32) if out else None
 
-    def get_latest_window(self) -> np.ndarray:
-        if len(self.buffer) < WINDOW_SIZE:
+    def get_latest_window(self,
+                      intra_stride: int = 20) -> np.ndarray:
+        """
+        Return the most recent (160,) normalised window from the buffer.
+        With intra_stride=20 at 20 Hz collection, this is the trailing
+        20 seconds, sampled at 1 Hz.
+        """
+        span = WINDOW_SIZE * intra_stride
+        if len(self.buffer) < span:
             return None
         if not self.scaler_fitted:
             self.fit_scaler()
-        data = self._normalise(
-            np.array(list(self.buffer)[-WINDOW_SIZE:], dtype=np.float32))
-        return data.flatten()
+        tail = np.array(list(self.buffer)[-span:], dtype=np.float32)
+        data = self._normalise(tail)
+        return data[::intra_stride].flatten()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -945,9 +994,22 @@ class FederatedClient:
             print(f"[Client] Buffer not ready "
                   f"({len(self.collector.buffer)}/{MIN_BUFFER_FRAMES})")
             return
+        # Refit the scaler against the current buffer before training so the
+        # z-score baseline tracks the vehicle's actual operating distribution
+        # as the trip evolves. Without this, scaler stays frozen at whatever
+        # the vehicle was doing in the first ~100 s after startup.
+        if self.collector.fit_scaler(refit=True):
+            print(f"[Client] Scaler refit  mean={self.collector.mean}  "
+                  f"std={self.collector.std}")
 
         self._publish_status("training")
-        windows = self.collector.get_windows(stride=20)   # non-overlapping
+        # 1-Hz windowing: each window covers 20 s of driving (intra_stride=20
+        # at 20 Hz collection); next window starts 1 s after the previous
+        # (step=20). See WINDOW_INTRA_STRIDE in config block above.
+        windows = self.collector.get_windows(
+            step=20, intra_stride=WINDOW_INTRA_STRIDE
+        )
+        # windows = self.collector.get_windows(stride=20)   # non-overlapping
         if windows is None:
             self._publish_status("idle")
             return
