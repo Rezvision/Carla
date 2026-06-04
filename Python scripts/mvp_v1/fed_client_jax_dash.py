@@ -966,6 +966,11 @@ class FederatedClient:
             client.subscribe("federated/model/global")
             client.subscribe("federated/aggregation/trigger")
             client.subscribe(f"federated/clients/{self.client_id}/commands")
+            client.publish("federated/clients/status",
+                       json.dumps({"client_id": self.client_id,
+                                   "status": "online",
+                                   "timestamp": time.time()}),
+                       qos=1)
         else:
             print(f"[Client] FED MQTT connect failed: rc={rc}")
 
