@@ -1,0 +1,24 @@
+# ---------------------------------------------------------------------------
+# Install PyTorch SEPARATELY first — the build is platform-specific:
+#
+#   Windows / Linux with an NVIDIA GPU:
+#       pip install torch --index-url https://download.pytorch.org/whl/cu121
+#
+#   Mac or CPU-only:
+#       pip install torch
+#
+# Then install the rest with:
+#       pip install -r requirements.txt
+#
+# (PyTorch is deliberately not pinned here so each machine gets the right
+#  GPU/CPU build; everything below is platform-independent.)
+# ---------------------------------------------------------------------------
+
+opacus
+pandas
+pyarrow
+scikit-learn
+matplotlib
+numpy
+tqdm
+pytest

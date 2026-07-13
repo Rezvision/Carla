@@ -1,0 +1,35 @@
+Loading sessions …
+
+=== Baseline ===
+Epoch   1/30  train=0.045470  val=0.073499
+Epoch   2/30  train=0.027701  val=0.059340
+Epoch   3/30  train=0.017490  val=0.050919
+Epoch   4/30  train=0.011934  val=0.045397
+Epoch   5/30  train=0.009789  val=0.042627
+Epoch   6/30  train=0.008547  val=0.042455
+Epoch   7/30  train=0.007766  val=0.036489
+Epoch   8/30  train=0.007193  val=0.035862
+Epoch   9/30  train=0.006727  val=0.033549
+Epoch  10/30  train=0.006388  val=0.031530
+Epoch  11/30  train=0.006098  val=0.030237
+Epoch  12/30  train=0.005835  val=0.030122
+Epoch  13/30  train=0.005661  val=0.030839
+Epoch  14/30  train=0.005424  val=0.027816
+Epoch  15/30  train=0.005199  val=0.028580
+Epoch  16/30  train=0.005024  val=0.026950
+Epoch  17/30  train=0.004868  val=0.026237
+Epoch  18/30  train=0.004721  val=0.024544
+Epoch  19/30  train=0.004608  val=0.024472
+Epoch  20/30  train=0.004468  val=0.025017
+Epoch  21/30  train=0.004406  val=0.023428
+Epoch  22/30  train=0.004297  val=0.022537
+Epoch  23/30  train=0.004210  val=0.021672
+Epoch  24/30  train=0.004134  val=0.021961
+Epoch  25/30  train=0.004103  val=0.024305
+Epoch  26/30  train=0.004011  val=0.021912
+Epoch  27/30  train=0.003939  val=0.020977
+Epoch  28/30  train=0.003861  val=0.022944
+Epoch  29/30  train=0.003799  val=0.022443
+Epoch  30/30  train=0.003769  val=0.021170
+
+=== Input Perturbation ===
