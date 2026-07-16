@@ -1,0 +1,21 @@
+{
+  "config": {
+    "window": 50,
+    "n_features": 8,
+    "enc_dims": [
+      64,
+      32,
+      16
+    ],
+    "code_dim": 16,
+    "fsmn_order": 10,
+    "fsmn_order_fwd": 0,
+    "dropout": 0.1,
+    "activation": "relu"
+  },
+  "recon_threshold": 0.036219170317053795,
+  "err_mean": 0.012232044711709023,
+  "err_std": 0.009594850242137909,
+  "k": 2.5,
+  "num_params": 7080
+}
