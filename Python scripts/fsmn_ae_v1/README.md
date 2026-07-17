@@ -38,7 +38,7 @@ Changes from the paper for CAN:
 
 1. **No FlexRay framing** — static/dynamic segment logic, CRC, and arbitration IDs are
    dropped; decoded signals are z-score standardised and fed directly to the encoder.
-2. **Sequence windowing** matches `vae_v1` / `mvp_v1` (`WINDOW_SIZE=50`, `STRIDE=20`) so
+2. **Sequence windowing** matches `vae_v1` / `mvp_v1` (`WINDOW_SIZE=20`, `STRIDE=20`) so
    results are directly comparable across models.
 3. **FSMN memory order N=10** is kept as the paper default but is a free hyperparameter
    (`--fsmn-order`); it no longer maps to FlexRay static cycles.
@@ -93,7 +93,7 @@ python evaluate_fsmn.py ../../Data/new_data_processed --bundle checkpoints --nam
 ```
 
 Or open `evaluate_fsmn.ipynb` (run Jupyter from this directory). Reports PR AUC, macro F1,
-AUROC, recall/FPR at θ, per-attack PR AUC, parameter count, and batched latency.
+AUROC, recall/FPR at θ, per-attack PR AUC, parameter count, and streaming latency (p50/p99).
 
 ## Deployment note
 

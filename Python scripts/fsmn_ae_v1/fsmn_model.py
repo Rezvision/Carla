@@ -39,8 +39,8 @@ and only these — the detector itself is unchanged:
 
   2. The memory order N is re-interpreted for CAN. In the paper N=10 covers 10 FlexRay
      static cycles; here N is simply the number of past message-steps the memory block
-     mixes, and the sequence window (WINDOW_SIZE / STRIDE) matches the sibling vae_v1 /
-     mvp_v1 models so results are directly comparable. N defaults to 10 (paper value) but
+     mixes, and the sequence window (WINDOW_SIZE=20 / STRIDE=20) matches mvp_v1 /
+     vae_v1 so results are directly comparable. N defaults to 10 (paper value) but
      is a free hyperparameter you can retune to the CAN message periodicity.
 
 Everything else — the unsupervised reconstruction objective, the L1-sparse latent, the
@@ -72,10 +72,11 @@ except ImportError as e:  # pragma: no cover
 # Configuration (paper Sec. III-A / III-B, Table 2)
 # ──────────────────────────────────────────────────────────────────────────────
 
-# Sequence window over decoded-CAN messages. Kept identical to vae_v1 / mvp_v1 so the
-# three models are compared on the same inputs. (In the FlexRay paper the "window" is
-# the FSMN memory order below, not this sequence length.)
-WINDOW_SIZE = 50
+# Sequence window over decoded-CAN messages. Kept identical to vae_v1 / mvp_v1
+# (WINDOW_SIZE=20, STRIDE=20) so the three models are compared on the same inputs.
+# (In the FlexRay paper the "window" often means the FSMN memory order N, not this
+# sequence length.)
+WINDOW_SIZE = 20
 STRIDE = 20
 
 # Decoded-CAN signal channels used as model input.

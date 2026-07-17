@@ -27,8 +27,9 @@ embedding layer (Sec. 3.1.1). This repository's data is *already translated* CAN
 decoded continuous signals (speed, battery, throttle, brake, steering, gear,
 location_x, location_y). Those signals are continuous, so the binary->continuous
 embedding step is unnecessary and is omitted; the decoded signals are fed directly
-into the same dual-scale message window (WINDOW_SIZE=50, STRIDE=20 per Table 3.1)
-and z-score standardised before the model, exactly as in Sec. 3.1.3.
+into a message window aligned with mvp_v1 (WINDOW_SIZE=20, STRIDE=20) and
+z-score standardised before the model. (The VAE paper used window 50; we use 20
+so all models in this repo are comparable on the same inputs.)
 """
 from __future__ import annotations
 
@@ -62,8 +63,8 @@ except ImportError as e:  # pragma: no cover
 # Configuration (paper Table 3.1)
 # ──────────────────────────────────────────────────────────────────────────────
 
-# Message-based window: 50 consecutive messages, stride 20.
-WINDOW_SIZE = 50
+# Message-based window: 20 consecutive messages, stride 20 (matches mvp_v1).
+WINDOW_SIZE = 20
 STRIDE = 20
 
 # Decoded-CAN signal channels used as model input.
@@ -95,10 +96,10 @@ THRESHOLD_MARGIN = 0.0
 # Recurrent activation.
 #
 # The paper (Sec. 3.2) states the LSTM uses ReLU. In practice a ReLU LSTM has an
-# unbounded cell state and its forward activations explode over length-50 sequences,
-# giving useless (1e11+) reconstruction errors. We therefore default to the standard,
-# numerically stable ``tanh`` used by virtually all LSTM autoencoders, and expose
-# ``relu`` as an opt-in for faithfulness experiments.
+# unbounded cell state and its forward activations can explode over multi-step
+# sequences, giving useless (1e11+) reconstruction errors. We therefore default to
+# the standard, numerically stable ``tanh`` used by virtually all LSTM autoencoders,
+# and expose ``relu`` as an opt-in for faithfulness experiments.
 DEFAULT_ACTIVATION = "tanh"
 GRAD_CLIP_NORM = 5.0
 

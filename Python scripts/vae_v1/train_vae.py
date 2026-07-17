@@ -117,7 +117,7 @@ def main():
     ap.add_argument("--lstm-units", type=int, default=64)
     ap.add_argument("--activation", choices=("tanh", "relu"), default="tanh",
                     help="LSTM activation. Paper specifies relu; tanh (default) is "
-                         "numerically stable over length-50 sequences.")
+                         "numerically stable over multi-step sequences.")
     ap.add_argument("--n-samples", type=int, default=N_SAMPLES_TRAIN)
     ap.add_argument("--val-ratio", type=float, default=0.15,
                     help="fraction of the (sequential) tail used for threshold calibration")

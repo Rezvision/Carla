@@ -20,10 +20,13 @@ Decoder :  RepeatVector  ->  LSTM  ->  TimeDistributed Dense (no output activati
 Loss    :  beta-VAE  =  MSE reconstruction  +  beta * KL divergence
 ```
 
-Hyperparameters follow Table 3.1: latent dim 10, window 50, stride 20, batch 1024,
+Hyperparameters follow Table 3.1 where applicable: latent dim 10, batch 1024,
 AdamW with cosine-decay LR (1e-3 → 0), 100 epochs, multi-sampling 5,
 β = 0.8 (reconstruction objective) / β = 2 (latent objective). Isolation Forest:
 100 estimators, contamination 5e-3, random_state 42.
+
+**Windowing** is standardised with `mvp_v1` / `fsmn_ae_v1`: **window 20, stride 20**
+(the paper used window 50; we use 20 for fair cross-model comparison).
 
 ### Three detection heads (paper Sec. 3.3)
 
@@ -46,14 +49,14 @@ speed_kmh, battery_level, throttle, brake, steering, gear, location_x, location_
 
 Because those signals are already continuous, the binary→continuous embedding step
 and the payload-byte/entropy temporal features are unnecessary and are omitted. The
-decoded signals are fed directly into the paper's message window (50 messages,
-stride 20) and z-score standardised before the model, exactly as in Sec. 3.1.3.
+decoded signals are fed into windows of **20 messages, stride 20** (same as `mvp_v1`)
+and z-score standardised before the model.
 
 ### Activation note
 
 The paper states the LSTMs use **ReLU**. A ReLU LSTM has an unbounded cell state
-whose forward activations explode over length-50 sequences (reconstruction errors
-of 1e11+), making it unusable here. The code therefore defaults to the standard,
+whose forward activations can explode over multi-step sequences (reconstruction
+errors of 1e11+), making it unusable here. The code therefore defaults to the standard,
 numerically stable **tanh** (used by virtually all LSTM autoencoders) plus gradient
 clipping, and exposes `--activation relu` for faithfulness experiments.
 
