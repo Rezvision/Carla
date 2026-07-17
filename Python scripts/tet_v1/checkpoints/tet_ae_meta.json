@@ -1,0 +1,19 @@
+{
+  "config": {
+    "window": 20,
+    "n_features": 8,
+    "ae_latent": 4,
+    "ae_hidden": 16,
+    "d_model": 64,
+    "n_heads": 4,
+    "n_layers": 2,
+    "ff_dim": 128,
+    "dropout": 0.1,
+    "noise_std": 0.1
+  },
+  "recon_threshold": 0.21869271248579025,
+  "err_mean": 0.0316741056740284,
+  "err_std": 0.07480744272470474,
+  "k": 2.5,
+  "num_params": 68080
+}
