@@ -1,7 +1,11 @@
 import os
+import time
+
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+
+from src.timing import TrainTiming
 
 # Opacus imports — will raise ImportError with a clear message if not installed
 try:
@@ -33,6 +37,10 @@ def train_dpsgd(model, train_dataset, val_dataset, save_path,
                           (Papernot & Steinke 2022) — see METHODS.md §4.
         epsilon_final   : ε after the LAST epoch actually trained (informational only;
                           do not plot this against the returned model's utility).
+        timing          : TrainTiming(train_seconds, epochs_ran) — wall-clock cost
+                          (TIMING_TASK.md part B). DP-SGD is expected to be far slower
+                          per epoch than train(): Opacus computes PER-SAMPLE gradients
+                          and splits the logical batch into smaller physical batches.
     """
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -70,7 +78,15 @@ def train_dpsgd(model, train_dataset, val_dataset, save_path,
 
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
 
+    # Same measurement as train() (sync-bracketed wall clock over the whole loop) so the
+    # DP-SGD slowdown factor is a like-for-like ratio, not an artefact of timing method.
+    if device.type == "cuda" and torch.cuda.is_available():
+        torch.cuda.synchronize(device)
+    _t0 = time.perf_counter()
+    epochs_ran = 0
+
     for epoch in range(1, epochs + 1):
+        epochs_ran = epoch
         model.train()
         train_loss = 0.0
 
@@ -120,6 +136,12 @@ def train_dpsgd(model, train_dataset, val_dataset, save_path,
                 print(f"Early stopping at epoch {epoch} (best val={best_val_loss:.6f})")
                 break
 
+    if device.type == "cuda" and torch.cuda.is_available():
+        torch.cuda.synchronize(device)
+    timing = TrainTiming(train_seconds=time.perf_counter() - _t0, epochs_ran=epochs_ran)
+    print(f"Trained {epochs_ran} epoch(s) in {timing.train_seconds:.1f}s "
+          f"({timing.sec_per_epoch:.2f}s/epoch, DP-SGD/Opacus per-sample gradients)")
+
     epsilon_final = privacy_engine.get_epsilon(delta)
     model._module.load_state_dict(torch.load(save_path, map_location=device, weights_only=True))
-    return model._module, epsilon_at_best, epsilon_final
+    return model._module, epsilon_at_best, epsilon_final, timing

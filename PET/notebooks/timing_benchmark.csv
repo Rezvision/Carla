@@ -1,0 +1,6 @@
+family,config,epochs,train_seconds,sec_per_epoch,derive_seconds,trained,device,hostname,batch_size,note
+Baseline,no DP,3.0,151.99691540002823,50.66563846667608,,True,cuda:NVIDIA GeForce RTX 3070 Ti,WS-PBWS1004508,256,warm measurement; the discarded warm-up run absorbed CUDA init
+Input,σ=0.1,3.0,135.47668700001668,45.15889566667223,,True,cuda:NVIDIA GeForce RTX 3070 Ti,WS-PBWS1004508,256,"noise is applied to the data once, then training is ordinary — so cost/epoch matches the baseline"
+Output,σ=0.005 (derived),,,0.0,0.0015495999832637608,False,cuda:NVIDIA GeForce RTX 3070 Ti,WS-PBWS1004508,256,derived from an existing checkpoint by seeded noise — no training
+Output (last-layer),σ=0.005 (derived),,,0.0,0.0006687999702990055,False,cuda:NVIDIA GeForce RTX 3070 Ti,WS-PBWS1004508,256,derived from an existing checkpoint by seeded noise — no training
+DP-SGD,"clip=1.0, nm=1.0",3.0,8816.22986229998,2938.7432874333267,,True,cuda:NVIDIA GeForce RTX 3070 Ti,WS-PBWS1004508,256,Opacus per-sample gradients + physical-batch splitting — the cause of the slowdown vs baseline

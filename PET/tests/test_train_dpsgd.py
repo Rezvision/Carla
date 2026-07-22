@@ -24,7 +24,7 @@ def test_dpsgd_runs_one_epoch(tmp_path):
     val_ds = _tiny_dataset(n=32, seed=8)
     model = GRUAutoencoder(input_size=9, hidden_size=16, num_layers=1)
     save_path = str(tmp_path / "dpsgd_test.pth")
-    trained_model, epsilon, epsilon_final = train_dpsgd(
+    trained_model, epsilon, epsilon_final, timing = train_dpsgd(
         model, train_ds, val_ds, save_path=save_path,
         noise_multiplier=1.0, max_grad_norm=1.0,
         epochs=1, batch_size=32,
@@ -39,14 +39,14 @@ def test_dpsgd_epsilon_increases_with_epochs(tmp_path):
     val_ds = _tiny_dataset(n=32, seed=8)
 
     model1 = GRUAutoencoder(input_size=9, hidden_size=16, num_layers=1)
-    _, eps1, _ = train_dpsgd(
+    _, eps1, _, _ = train_dpsgd(
         model1, train_ds, val_ds,
         save_path=str(tmp_path / "e1.pth"),
         noise_multiplier=1.0, epochs=1, batch_size=64,
     )
 
     model2 = GRUAutoencoder(input_size=9, hidden_size=16, num_layers=1)
-    _, eps2, _ = train_dpsgd(
+    _, eps2, _, _ = train_dpsgd(
         model2, train_ds, val_ds,
         save_path=str(tmp_path / "e2.pth"),
         noise_multiplier=1.0, epochs=2, batch_size=64,
@@ -60,14 +60,14 @@ def test_dpsgd_higher_noise_lower_epsilon(tmp_path):
     val_ds = _tiny_dataset(n=32, seed=8)
 
     model_low = GRUAutoencoder(input_size=9, hidden_size=16, num_layers=1)
-    _, eps_low_noise, _ = train_dpsgd(
+    _, eps_low_noise, _, _ = train_dpsgd(
         model_low, train_ds, val_ds,
         save_path=str(tmp_path / "low.pth"),
         noise_multiplier=0.5, epochs=1, batch_size=64,
     )
 
     model_high = GRUAutoencoder(input_size=9, hidden_size=16, num_layers=1)
-    _, eps_high_noise, _ = train_dpsgd(
+    _, eps_high_noise, _, _ = train_dpsgd(
         model_high, train_ds, val_ds,
         save_path=str(tmp_path / "high.pth"),
         noise_multiplier=4.0, epochs=1, batch_size=64,
@@ -83,7 +83,7 @@ def test_dpsgd_clip_sweep_finite_epsilon(tmp_path):
 
     for clip, i in [(0.5, "a"), (5.0, "b")]:
         model = GRUAutoencoder(input_size=9, hidden_size=16, num_layers=1)
-        _, eps, _ = train_dpsgd(
+        _, eps, _, _ = train_dpsgd(
             model, train_ds, val_ds,
             save_path=str(tmp_path / f"clip_{i}.pth"),
             noise_multiplier=1.0, max_grad_norm=clip,
@@ -104,14 +104,14 @@ def test_dpsgd_clip_does_not_change_epsilon(tmp_path):
     val_ds = _tiny_dataset(n=32, seed=8)
 
     model_small = GRUAutoencoder(input_size=9, hidden_size=16, num_layers=1)
-    _, eps_small_clip, _ = train_dpsgd(
+    _, eps_small_clip, _, _ = train_dpsgd(
         model_small, train_ds, val_ds,
         save_path=str(tmp_path / "small_clip.pth"),
         noise_multiplier=1.0, max_grad_norm=0.5, epochs=1, batch_size=64,
     )
 
     model_large = GRUAutoencoder(input_size=9, hidden_size=16, num_layers=1)
-    _, eps_large_clip, _ = train_dpsgd(
+    _, eps_large_clip, _, _ = train_dpsgd(
         model_large, train_ds, val_ds,
         save_path=str(tmp_path / "large_clip.pth"),
         noise_multiplier=1.0, max_grad_norm=5.0, epochs=1, batch_size=64,
@@ -141,7 +141,7 @@ def test_dpsgd_epsilon_at_best_checkpoint_not_final(tmp_path):
     train_ds = _tiny_dataset_scaled(128, 10, 9, seed=seed)
     val_ds = _tiny_dataset_scaled(32, 10, 9, seed=seed + 100, offset=2.0)
 
-    _, eps_at_best, eps_final = train_dpsgd(
+    _, eps_at_best, eps_final, _ = train_dpsgd(
         model, train_ds, val_ds, save_path=str(tmp_path / "rigged.pth"),
         noise_multiplier=1.0, max_grad_norm=1.0,
         epochs=4, batch_size=32, patience=999,

@@ -20,3 +20,15 @@ env/
 # OS / editor
 .DS_Store
 .vscode/
+
+# Office owner/lock files (~$Figure_Explainer.docx) — Word writes one beside every open
+# document and removes it on close, so they are session state, never deliverables.
+~$*
+
+# Transient run artifacts (crash-safety partials + raw sweep logs, incl. the ~27MB run.err)
+**/*_partial.csv
+notebooks/*.err
+notebooks/*.log
+
+# Local scratch backups of result tables (not deliverables)
+scratch_backup/

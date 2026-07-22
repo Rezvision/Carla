@@ -1,0 +1,6 @@
+privacy_bar_eff_mi,Input_config_point,Input_retained_point_pct,Input_config_ci,Input_retained_ci_pct,Output_config_point,Output_retained_point_pct,Output_config_ci,Output_retained_ci_pct,Output-LL_config_point,Output-LL_retained_point_pct,Output-LL_config_ci,Output-LL_retained_ci_pct,DP-SGD_config_point,DP-SGD_retained_point_pct,DP-SGD_config_ci,DP-SGD_retained_ci_pct,Personalized_config_point,Personalized_retained_point_pct,Personalized_config_ci,Personalized_retained_ci_pct
+0.51,,,,,σ=0.0091809,90.87688747757197,,,,,,,,,,,,,,
+0.55,,,,,σ=0.0091809,90.87688747757197,,,,,,,,,,,,,,
+0.6,σ=2,88.53915579553322,,,σ=0.0052183,96.80111974111173,,,,,,,"C=0.5, nm=1",35.618896747230046,,,,,,
+0.65,σ=2,88.53915579553322,σ=2,88.53915579553322,σ=0.0052183,96.80111974111173,σ=0.0091809,90.87688747757197,σ=0.05,96.9305706772336,,,"C=0.5, nm=1",35.618896747230046,"C=0.5, nm=1",35.618896747230046,,,,
+0.7,σ=2,88.53915579553322,σ=2,88.53915579553322,σ=0.00054461,99.98788890532526,σ=0.0052183,96.80111974111173,σ=0.05,96.9305706772336,σ=0.05,96.9305706772336,"C=0.5, nm=1",35.618896747230046,"C=0.5, nm=1",35.618896747230046,σ=v1:0.104 | v2:0.097 | v3:0.056,35.130182569860324,,
