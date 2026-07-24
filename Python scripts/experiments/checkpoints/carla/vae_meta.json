@@ -1,0 +1,11 @@
+{
+  "config": {
+    "window": 20,
+    "n_features": 8,
+    "lstm_units": 64,
+    "latent_dim": 10,
+    "activation": "tanh"
+  },
+  "recon_threshold": 1.9810177087783813,
+  "dist_threshold": 0.00566774019347063
+}

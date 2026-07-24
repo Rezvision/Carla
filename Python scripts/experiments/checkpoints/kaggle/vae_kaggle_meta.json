@@ -1,0 +1,30 @@
+{
+  "model": "vae",
+  "display_name": "VAE",
+  "features": [
+    "engine_rpm",
+    "engine_temp_c",
+    "oil_pressure_psi",
+    "engine_load_percent",
+    "throttle_pos_percent",
+    "vibration_level",
+    "brake_pedal_pos_percent",
+    "brake_temp_c",
+    "brake_fluid_level_psi",
+    "battery_voltage_v",
+    "battery_charge_percent",
+    "vehicle_speed_kph"
+  ],
+  "n_features": 12,
+  "window_size": 20,
+  "stride": 1,
+  "threshold": 1.088771104812622,
+  "n_params": 40992,
+  "n_train": 680,
+  "n_val": 120,
+  "needs_timestamps": false,
+  "uses_flat_windows": false,
+  "scaler": "/Users/mohazrati/Documents/Google DeepMind Research Ready/Intrusion Detection in Vehicular Systems/Unsupervised Intrusion Detection on Resource Constrained Edge Devices/implementations/base_GRU/Carla/Python scripts/kaggle_v1/checkpoints/vae_kaggle_scaler.npz",
+  "outdir": "/Users/mohazrati/Documents/Google DeepMind Research Ready/Intrusion Detection in Vehicular Systems/Unsupervised Intrusion Detection on Resource Constrained Edge Devices/implementations/base_GRU/Carla/Python scripts/kaggle_v1/checkpoints",
+  "name": "vae_kaggle"
+}

@@ -1,0 +1,31 @@
+{
+  "model": "gru",
+  "display_name": "GRU-AE",
+  "features": [
+    "engine_rpm",
+    "engine_temp_c",
+    "oil_pressure_psi",
+    "engine_load_percent",
+    "throttle_pos_percent",
+    "vibration_level",
+    "brake_pedal_pos_percent",
+    "brake_temp_c",
+    "brake_fluid_level_psi",
+    "battery_voltage_v",
+    "battery_charge_percent",
+    "vehicle_speed_kph"
+  ],
+  "n_features": 12,
+  "window_size": 20,
+  "stride": 1,
+  "threshold": 1.092434048652649,
+  "n_params": 9036,
+  "n_train": 340,
+  "n_val": 60,
+  "needs_timestamps": false,
+  "uses_flat_windows": true,
+  "scaler": "/Users/mohazrati/Documents/Google DeepMind Research Ready/Intrusion Detection in Vehicular Systems/Unsupervised Intrusion Detection on Resource Constrained Edge Devices/implementations/base_GRU/Carla/Python scripts/kaggle_v1/checkpoints/gru_kaggle_scaler.npz",
+  "outdir": "/Users/mohazrati/Documents/Google DeepMind Research Ready/Intrusion Detection in Vehicular Systems/Unsupervised Intrusion Detection on Resource Constrained Edge Devices/implementations/base_GRU/Carla/Python scripts/kaggle_v1/checkpoints",
+  "name": "gru_kaggle",
+  "val_fpr": 0.016666666666666666
+}

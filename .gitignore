@@ -1,0 +1,11 @@
+# HCRL CAN data — too large for GitHub (regenerate / keep local only)
+#   python -m datasets.can.preprocess
+#   python -m datasets.can.preprocess --include-attacks
+Data/CAN/raw/
+Data/CAN/processed/
+
+.DS_Store
+**/.DS_Store
+
+__pycache__/
+*.py[cod]
