@@ -6,6 +6,7 @@ Unified trainer entrypoint.
     python -m experiments.train --dataset carla  --model gru     --epochs 20
     python -m experiments.train --dataset kaggle --model fsmn    --epochs 50
     python -m experiments.train --dataset can    --model can_gru --epochs 20
+    python -m experiments.train --dataset can    --model can_vae --epochs 50
 
 Also available as ``python -m ids_core.train ...``.
 """

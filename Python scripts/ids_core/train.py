@@ -7,6 +7,7 @@ Unified trainer for CARLA + Kaggle + raw CAN.
     python -m experiments.train --dataset kaggle --model fsmn    --epochs 50
     python -m datasets.can.preprocess
     python -m experiments.train --dataset can    --model can_gru --epochs 20
+    python -m experiments.train --dataset can    --model can_vae --epochs 50 --objective recon
 
 Checkpoints default to experiments/checkpoints/{dataset}/.
 """
@@ -68,7 +69,7 @@ def main(argv: list[str] | None = None) -> int:
         model_kwargs["l1"] = args.l1
         fit_kwargs["k"] = args.k
         fit_kwargs["l1"] = args.l1
-    elif args.model == "vae":
+    elif args.model in ("vae", "can_vae"):
         model_kwargs["objective"] = args.objective
     elif args.model == "tet":
         model_kwargs["k"] = args.k

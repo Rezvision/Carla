@@ -6,6 +6,8 @@ from typing import Any
 from .base import ModelSpec, ReconstructionModel
 from .can_gru import CANGRUAdapter
 from .can_gru import SPEC as CAN_GRU_SPEC
+from .can_vae import CANVAEAdapter
+from .can_vae import SPEC as CAN_VAE_SPEC
 from .fsmn import FSMNAdapter
 from .fsmn import SPEC as FSMN_SPEC
 from .gru import GRUAdapter
@@ -21,6 +23,7 @@ _SPECS = {
     FSMN_SPEC.key: FSMN_SPEC,
     TET_SPEC.key: TET_SPEC,
     CAN_GRU_SPEC.key: CAN_GRU_SPEC,
+    CAN_VAE_SPEC.key: CAN_VAE_SPEC,
 }
 _BUILDERS = {
     "gru": GRUAdapter,
@@ -28,6 +31,7 @@ _BUILDERS = {
     "fsmn": FSMNAdapter,
     "tet": TETAdapter,
     "can_gru": CANGRUAdapter,
+    "can_vae": CANVAEAdapter,
 }
 MODEL_NAMES = tuple(_BUILDERS.keys())
 

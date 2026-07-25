@@ -12,9 +12,10 @@ cd "Python scripts"
 python -m experiments.train --dataset carla  --model gru  --epochs 20
 python -m experiments.train --dataset kaggle --model fsmn --epochs 50
 
-# Raw CAN (HCRL) — Chowdhury FE + GRU backbone
+# Raw CAN (HCRL) — Chowdhury FE + GRU / VAE
 python -m datasets.can.preprocess
 python -m experiments.train --dataset can --model can_gru --epochs 20
+python -m experiments.train --dataset can --model can_vae --epochs 50 --objective recon
 
 # Equivalent
 python -m ids_core.train --dataset carla --model gru --epochs 20
@@ -29,7 +30,7 @@ Figures → `experiments/figures/{carla|kaggle|can}/`
 ids_core/
   profiles/       # carla.py / kaggle.py / can.py DatasetProfile
   data.py         # unified parquet → windows
-  models/         # thin adapters (GRU / VAE / FSMN / TET / CAN-GRU)
+  models/         # thin adapters (GRU / VAE / FSMN / TET / CAN-GRU / CAN-VAE)
   trainer.py      # shared train loop
   train.py        # CLI
 
@@ -38,20 +39,26 @@ datasets/         # CSV→parquet, augmentation
 experiments/      # train / compare / evaluate / artifacts
 ```
 
-## Raw CAN model (`can_gru`)
+## Raw CAN models (`can_gru`, `can_vae`)
 
-Separate from the decoded-telemetry ``gru``. Uses the feature engineering the
-VAE paper describes for raw frames (ID bit embedding, payload bytes, temporal
-channels) with the GRU-AE reconstruction backbone.
+Shared Chowdhury-style FE (ID bit embedding, payload bytes, temporal channels)
+on the `can` profile. Backbones differ:
+
+| Model | Backbone | Detection heads |
+|-------|----------|-----------------|
+| `can_gru` | GRU-AE | reconstruction |
+| `can_vae` | LSTM β-VAE | reconstruction, latent distance, Isolation Forest |
 
 ```bash
-python -m datasets.can.preprocess                  # normal_run_data.csv → parquet
+python -m datasets.can.preprocess                  # normal → parquet
 python -m datasets.can.preprocess --include-attacks
 python -m experiments.train --dataset can --model can_gru --epochs 20
+python -m experiments.train --dataset can --model can_vae --epochs 50 --objective recon
 ```
 
-Eval notebook: `experiments/notebooks/evaluate_can_gru.ipynb`  
-(scores real HCRL DoS / Fuzzy / RPM / gear traces against held-out normal traffic).
+Eval notebooks:
+- `experiments/notebooks/evaluate_can_gru.ipynb`
+- `experiments/notebooks/evaluate_can_vae.ipynb` (all 3 heads)
 
 ## Compatibility
 
